@@ -1,0 +1,631 @@
+---
+title: "R Notebook"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+#### 1. ACCESS BABASE
+```{r}
+#Open 'Utilities'>'Terminal'
+#ssh -f mjc107@papio.biology.duke.edu -L 2222:localhost:5432 -N
+
+#Install devtools if not already present
+if (!("devtools" %in% installed.packages()[,"Package"]))
+  install.packages("devtools")
+# Install newest version of ramboseli if not already installed
+devtools::install_github("amboseli/ramboseli")
+#devtools::install_github("amboseli/ramboseli", ref = "ramboselitidyr-dev")
+Sys.setenv(TZ = 'UTC')
+list.of.packages <- list("foreach", "doSNOW", "parallel", "tidyverse",
+                         "lubridate", "dbplyr", "purrrlyr", "RPostgreSQL",
+                         "zoo", "ramboseli")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if (length(new.packages)) install.packages(unlist(new.packages))
+lapply(list.of.packages, require, character.only = T)
+
+library(DHARMa)
+library(ramboseli)
+library(tidyverse)
+library(dbplyr)
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(corrplot)
+library(vegan)
+library(broom.mixed)
+library(RcppRoll)
+library(stringr)
+library(network)
+library(intergraph)
+library(igraph)
+# library(MuMIn)
+library(reshape2) 
+library(lubridate)
+library(hrbrthemes)
+library(viridis)
+library(forcats)
+library(coxme)
+library(lme4)
+library(car)
+library(ggfortify)
+library(survival)
+library(survminer)
+library(patchwork)
+
+# You will need to change user to your personal babase login AND get your password
+# One approach to doing that is through Rstudio
+# You could also just type it in your script, but that's not recommended for security.
+babase <- DBI::dbConnect(RPostgreSQL::PostgreSQL(),
+                           host = "localhost",
+                           port = 2222,
+                           user = "zf59",
+                           dbname = "babase",
+                           password = rstudioapi::askForPassword("Database password"))
+
+```
+
+#### 2. DATA MANAGEMENT
+
+#### 2.1 LOAD BABASE TABLES
+
+```{r}
+#Connect to source functions
+source("Functions.R") 
+
+# ---- LOAD DATAFRAMES ------------------------------------------------------
+
+# Database connections
+biograph <- tbl(babase, "biograph")
+members <- tbl(babase, "members")
+maturedates <- tbl(babase, "maturedates")
+rankdates <- tbl(babase, "rankdates")
+maternities <- tbl(babase, "maternities")
+actor_actees <- tbl(babase, "actor_actees")
+samples_goff <- tbl(babase, "samples_goff")
+groups_history <- tbl(babase, "groups_history")
+
+# Get local copy of biograph table
+biograph_l <- collect(tbl(babase, "biograph"))
+
+#Get local copy of maternities table
+maternities_l <- collect(tbl(babase, "maternities"))
+
+#Get local copy of groups history table
+groups_history_l <- collect(tbl(babase, "groups_history"))
+
+#Get local copy of maturedates
+maturedates_l <- collect(tbl(babase, "maturedates"))
+
+#Get local copy of rankdates
+rankdates_l <- collect(tbl(babase, "rankdates"))
+
+# ---- JOIN DATAFRAMES ------------------------------------------------------
+
+#Create connection version
+# Join maturedates to biograph
+md_females <- maturedates %>%
+  semi_join(filter(biograph, sex == "F"), by = "sname")
+
+# Join rankdates to biograph
+rd_males <- rankdates %>%
+  semi_join(filter(biograph, sex == "M"), by = "sname")
+
+#Create local version of md_females and rd_males
+# Join maturedates to biograph
+md_females_l <- maturedates %>%
+  semi_join(filter(biograph, sex == "F"), by = "sname") %>%
+  collect()
+
+# Join rankdates to biograph
+rd_males_l <- rankdates %>%
+  semi_join(filter(biograph, sex == "M"), by = "sname") %>%
+  collect()
+
+# ---- SUBSETTED DATASETS EXCLUDING BEHAVIORAL GAPS -------------------------
+members_l <- subset_members(babase)
+focals_l <- subset_focals(babase, members_l)
+females_l <- subset_females(members_l)
+grooming_l <- subset_interactions(babase, members_l, my_acts = c("G"))
+
+```
+
+#### 2.2 CREATE DATASET
+
+```{r}
+
+# ---- GRP YEARS -------------------------------------------------------------
+
+#Note: these grp years may need some revision after meetings with Susan and Laurence
+
+# The rows should be:
+#   - group years
+#   - groups that were study groups during year of interest
+#   - exclude group 1.3 (Proton's group
+#   - first start date should be the date the grp became a study grp
+#   - last end date can't occur after the last time the grp was a study grp
+
+#Create df where group years are level of observation
+groups <- groups_history_l %>%
+  filter(gid < 3 & gid != 1.3) %>% #eliminate non-study groups
+  filter(!is.na(first_study_grp_census)) %>% #Note: check why these are NA but listed as study groups
+  select(gid, name, permanent, impermanent, first_study_grp_census, last_reg_census, study_grp) %>%
+  mutate(last_time_study_grp = fifelse(!is.na(last_reg_census), as.Date(last_reg_census), 
+                                        fifelse(is.na(last_reg_census) & !is.na(impermanent), as.Date(impermanent), as.Date("2022-06-29")))) #create date telling last time grp was a study grp
+
+#Create a start date for each group year
+start_dates <- groups %>%
+  rowwise() %>%
+  do(data.frame(gid=.$gid, start=seq(.$first_study_grp_census,.$last_time_study_grp,by="1 year")))
+
+#Create group year df with start and end date for each year
+group_years <- groups %>%
+  dplyr::left_join(select(start_dates, "gid", "start"), by = "gid") %>% #join start dates
+  mutate(end = start + years(1) - days(1),
+         grp_year_length = end - start) %>%
+  filter(end < last_time_study_grp) #end date can't occur after the last time the grp was a study grp
+
+```
+
+#### 3. CALCULATE VARIABLES FOR ANALYSIS
+
+#### 3.1 NETWORK DENSITY AND GROUP SIZE
+
+This is code I wrote to estimate network density and group size for a different analysis. In that analysis infant baboons were the level of observation and the start and end dates were a six month window during their early life. The df that held all my final data was called "subjects" which is here the equivalent of our "group_years" df. This code needs to be adapted to estimate network density for each group year.
+
+n_adults = group size (we will also want to separate this by sex e.g., n_adults_female and n_adults_male)
+net_density_wog = network density
+
+Resources I used:
+https://towardsdatascience.com/how-to-model-a-social-network-with-r-878b3a76c5a1
+http://pablobarbera.com/big-data-upf/html/02a-networks-intro-visualization.html
+
+```{r}
+
+# Find all adult members in each group on each date
+adult_members <- members %>%
+  filter(grp < 3 & grp != 1.3) %>%
+  inner_join(select(biograph, sname, sex), by = "sname") %>%
+  left_join(select(md_females, sname, matured), by = "sname") %>%
+  left_join(select(rd_males, sname, ranked), by = "sname") %>%
+  filter((sex == "F" & date >= matured) | (sex == "M" & date >= ranked)) %>%
+  collect()
+
+#Network density without individuals with no grooms
+grpyr_df <- group_years %>% 
+  rowwise() %>% 
+  mutate(sub_groom_df = list(subset_grooming(gid, start, end))) %>% 
+  ungroup()
+
+grpyr_df <- grpyr_df %>% 
+  rowwise() %>% 
+  mutate(sub_members_df = list(subset_membership_WITHOUT183(gid, start, end))) %>% 
+  ungroup()
+
+#Count number of grooms in groups
+grpyr_df <- grpyr_df %>%
+  mutate(groom_rows = sapply(sub_groom_df, NROW)) %>% #Find number of rows in each sub_groom_df
+  filter(groom_rows != "0") #eliminate grps with no grooms in their group due to behave gaps
+
+#NOTE: This df still includes some behavioural gaps, where some grooming data has been recorded - we should decide what to do about these (we will control for observer effort later on)
+
+#Count number of members in group >= 183 days to get group size
+grpyr_df <- grpyr_df %>%
+  mutate(n_adults = sapply(sub_members_df, NROW))
+
+grpyr_df <- grpyr_df %>%
+  mutate(net_density_wog = map2_dbl(sub_groom_df, sub_members_df, get_net_density_wog)) #network density including individuals with no grooms
+
+#Join grpyr_df to subjects on mom_sname and end date
+group_years <- group_years %>%
+  left_join(select(grpyr_df, gid, end, n_adults, net_density_wog, sub_members_df), by = c("gid", "end")) %>%
+  mutate(net_density_wog = as.numeric(net_density_wog))
+
+
+#### 1. Example network: Low network density
+
+#Practice on one dataframe
+#Subset grooming dataframe by group and time period
+edges_sna_df <- subset(grooming_l, as.Date("2010-10-20") <= date & date <= as.Date("2011-10-19") & actor_grp==1.1100 & actee_grp==1.1100)
+
+edges.df <- edges_sna_df %>%
+  select(actor, actee) %>% #need actor, actee, total grooms
+  mutate(pairs = paste(actor, actee))
+
+edges.df <- edges.df %>%
+  count(pairs) %>%
+  mutate(actor = str_sub(pairs, 1, 3),
+         actee = str_sub(pairs, 5, 7)) %>% 
+  rename(weight = n) %>% 
+  select(actor, actee, weight, -pairs)
+
+#Create nodes df - Does include individuals with no grooms
+nodes_sna_df <- subset(adult_members, as.Date("2010-10-20") <= date & date <= as.Date("2011-10-19") & grp==1.1100)
+
+nodes.df <- nodes_sna_df %>%
+  rename(name = sname) %>%
+  distinct(name,.keep_all = TRUE) %>%
+  select(name, sex)
+nodes.df$id <- 1:nrow(nodes.df)
+
+#my_network <- graph_from_data_frame(d=edges.df, vertices=nodes.df, directed=FALSE) #creates multiplex network
+my_network <- graph_from_data_frame(d=edges.df, vertices=nodes.df, directed=TRUE)
+
+#Plot example network
+V(my_network)$color <- NA
+males <- nodes.df %>% filter(sex == "M")
+females <- nodes.df %>% filter(sex == "F")
+V(my_network)$color[V(my_network)$name %in% males$name] <- "cyan4"
+V(my_network)$color[V(my_network)$name %in% females$name] <- "darkseagreen2"
+vertex_attr(my_network)
+
+V(my_network)$size <- sqrt(strength(my_network)) * 1.1
+set.seed(270)
+fr <- layout_with_fr(my_network, niter=1000)
+par(mar=c(0,0,0,0)); plot(my_network, layout=fr, vertex.label.color=c("black"))
+title("", adj = 0, line = -1)
+legend(x=.75, y=.85, legend=c("Male", "Female"), 
+       pch=21, pt.bg=c("cyan4", "darkseagreen2"), pt.cex=2, bty="n")
+
+#Calculate network density
+my_network <- asNetwork(my_network)
+network_density <- network::network.density(my_network)
+
+```
+
+#### 3.2 OBSERVER EFFORT
+
+```{r}
+
+# ---- OBSERVER EFFORT ------------------------------------------------------
+
+#After 1999-10-04
+#Grp focal minutes per adult
+adult_focals <- samples_goff %>%
+  filter(grp_of_focal < 3 & grp_of_focal != 1.3) %>%
+  inner_join(select(biograph, sname, sex), by = "sname") %>%
+  left_join(select(md_females, sname, matured), by = "sname") %>%
+  left_join(select(rd_males, sname, ranked), by = "sname") %>%
+  filter((sex == "F" & date >= matured) | (sex == "M" & date >= ranked)) %>%
+  collect()
+
+#Join to subjects - zeros because no focal data in samples_goff before 1999-10-04
+group_years <- group_years %>%
+  rowwise() %>%
+  mutate(grp_focal_mins_post1999=get_focal_mins(adult_focals, start, end, gid))
+
+
+#Before 1999-10-04 - Note: there are some imperfections in these data in babase
+# Database connections
+a1 <- tbl(babase, in_schema("babase_pending", "altos_points_84to96mar3")) %>%
+  collect()
+names(a1)[6:8] <- c("nn", "n1", "n2")
+a1$n2 <- str_trim(a1$n2)
+a2 <- tbl(babase, in_schema("babase_pending", "altos_points_96marto99")) %>%
+  collect()
+names(a2)[6:8] <- c("nn", "n1", "n2")
+h1 <- tbl(babase, in_schema("babase_pending", "hooks_points_84to96")) %>%
+  collect()
+names(h1)[6:8] <- c("nn", "n1", "n2")
+h2 <- tbl(babase, in_schema("babase_pending", "hooks_points_96to99")) %>%
+  collect()
+names(h2)[6:8] <- c("nn", "n1", "n2")
+# Combine into one
+samples_pre1999 <- bind_rows(select(a1, -mpos),
+                  select(a2, -mpos),
+                  select(h1, -mpos),
+                  select(h2, -mpos))
+
+#Create local version of members with behave gaps included
+members_l3 <- collect(tbl(babase, "members"))
+
+#Focal minute totals for individuals each hour
+adult_focals_pre1999 <- samples_pre1999 %>%
+  group_by(sname, date, time) %>%
+  tally() %>%
+  ungroup()
+
+#Grp focal minutes per adult
+adult_focals_pre1999 <- adult_focals_pre1999 %>%
+  left_join(select(members_l3, sname, date, "grp_of_focal" = "grp"), by = c("sname", "date")) %>%
+  filter(grp_of_focal < 3 & grp_of_focal != 1.3) 
+
+adult_focals_pre1999 <- adult_focals_pre1999 %>%
+  inner_join(select(biograph_l, sname, sex), by = "sname") %>%
+  left_join(select(md_females_l, sname, matured), by = "sname") %>%
+  left_join(select(rd_males_l, sname, ranked), by = "sname") %>%
+  filter((sex == "F" & date >= matured) | (sex == "M" & date >= ranked)) %>%
+  rename("minsis" = "n")  %>%
+  collect()
+
+#Join to subjects - focal data from before 1999-10-04
+group_years <- group_years %>%
+  rowwise() %>%
+  mutate(grp_focal_mins_pre1999=get_focal_mins(adult_focals_pre1999, start, end, gid))
+
+#Calculate group observation effort
+group_years <- group_years %>%
+  mutate(obs_effort = ifelse(start < as.Date("1999-10-04"), as.numeric(grp_focal_mins_pre1999)/n_adults, as.numeric(grp_focal_mins_post1999)/n_adults)) 
+
+grpyr_df<-grpyr_df%>%
+  dplyr::left_join(select(group_years, "gid", "start", "obs_effort"), by = c("gid", "start"))
+
+
+
+# ---- CREATE RESIDUAL NETWORK DENSITY --------------------------------------------
+
+#NOTE: This does not run because some individuals get NAs for observer effort - we need to look into why this is
+
+#Make residual net density residuals
+l1<- lm(log(net_density_wog)~log(obs_effort),data=grpyr_df)
+grpyr_df$net_density_wog_resid<- resid(l1)
+
+#Group size vs DSI (females)
+ggplot(grpyr_df, aes(x=n_adults, y=net_density_wog_resid)) +
+      geom_point(size = 2.0, alpha = 0.7, colour="violetred4") +
+      theme_cowplot() +
+      ylab("Network density resid") +
+      xlab("Group size") +
+      geom_smooth(method=lm, colour="black", size=0.5)
+p1.m <- lm(net_density_wog_resid ~ n_adults, data=grpyr_df)
+
+
+```
+
+#### 3.3 Calculate Foraging Efficiency
+
+
+```{r}
+# CALCULATE POINT SAMPLES
+# Point sample data are in the old formats in babase_pending
+# In four different tables, which oddly have different column names
+# for proximity columns (so rename below)
+
+a1 <- tbl(babase, in_schema("babase_pending", "altos_points_84to96mar3")) %>%
+  collect()
+names(a1)[6:8] <- c("nn", "n1", "n2")
+a1$n2 <- str_trim(a1$n2)
+
+a2 <- tbl(babase, in_schema("babase_pending", "altos_points_96marto99")) %>%
+  collect()
+names(a2)[6:8] <- c("nn", "n1", "n2")
+
+h1 <- tbl(babase, in_schema("babase_pending", "hooks_points_84to96")) %>%
+  collect()
+names(h1)[6:8] <- c("nn", "n1", "n2")
+
+h2 <- tbl(babase, in_schema("babase_pending", "hooks_points_96to99")) %>%
+  collect()
+names(h2)[6:8] <- c("nn", "n1", "n2")
+
+
+# Combine into one
+points_old <- bind_rows(select(a1, -mpos),
+                        select(a2, -mpos),
+                        select(h1, -mpos),
+                        select(h2, -mpos))
+
+#Get local copy of points after 1999
+points_new <- collect(tbl(babase, "point_data"))
+
+biograph <-collect(tbl(babase, "biograph"))
+members <- collect(tbl(babase, "members"))
+samples <- collect(tbl(babase, "samples"))
+
+ex_group<- grpyr_df[[13]][[1]]
+ex_group$start[1]
+ex_group$end[1]
+
+## WORKING WITH NEW POINTS DATA
+# total of point samples for a particular group year row
+
+total_point_samples_gr_new<-function(sub_members_df){
+    sub_members_df%>%
+    left_join(samples, by="sname")%>%
+    left_join(points_new, by ="sid")%>%
+    filter(sex == "F")%>%
+    filter(date>start&date<end)
+}
+
+count_total_new<-function(sub_members_df){
+    total_point_samples_gr_new(sub_members_df)%>%
+    group_by(sname)%>%
+    count()
+}
+
+# time   spent   feeding: number of point samples from total sample adult females
+count_feeding_new<-function(sub_members_df){
+    total_point_samples_gr_new(sub_members_df)%>%
+    filter(activity=="F")%>%
+    group_by(sname)%>%
+    count()
+}
+
+# time   spent   moving:  # of point samples from total sample adult females
+count_moving_new<-function(sub_members_df){
+    total_point_samples_gr_new(sub_members_df)%>%
+    filter(activity=="W")%>%
+    group_by(sname)%>%
+    count()
+}
+
+# ## TEST WITH POINT SAMPLE NEW
+# group_point <- ex_group%>%
+#   left_join(samples, by="sname")%>%
+#   left_join(points_new, by ="sid")%>%
+#   filter(sex == "F")%>%
+#   filter(date>start&date<end)%>%
+#   filter(activity=="W")%>%
+#   group_by(sname)%>%
+#   count()
+
+# count samples from points new in groupyear df
+grpyr_df<-grpyr_df%>%
+  rowwise() %>% 
+  mutate(n_total_sample_new=sum(count_total_new(sub_members_df)$n))%>%
+  mutate(n_feeding_new = sum(count_feeding_new(sub_members_df)$n))%>%
+  mutate(n_moving_new = sum(count_moving_new(sub_members_df)$n))
+
+## WORKING WITH NEW POINTS DATA
+# total of point samples for a particular group year row
+
+total_point_samples_gr_old<-function(sub_members_df){
+    sub_members_df%>%
+    left_join(points_old, by ="sname")%>%
+    filter(sex == "F")%>%
+    filter(date>start&date<end)
+}
+
+count_total_old<-function(sub_members_df){
+    total_point_samples_gr_old(sub_members_df)%>%
+    group_by(sname)%>%
+    count()
+}
+
+# time   spent   feeding: number of point samples from total sample adult females
+count_feeding_old<-function(sub_members_df){
+    total_point_samples_gr_old(sub_members_df)%>%
+    filter(act=="F")%>%
+    group_by(sname)%>%
+    count()
+}
+
+# time   spent   moving:  # of point samples from total sample adult females
+count_moving_old<-function(sub_members_df){
+    total_point_samples_gr_old(sub_members_df)%>%
+    filter(act=="W")%>%
+    group_by(sname)%>%
+    count()
+}
+
+# count samples from points old in groupyear df
+grpyr_df<-grpyr_df%>%
+  rowwise() %>% 
+  mutate(n_total_sample_old=sum(count_total_old(sub_members_df)$n))%>%
+  mutate(n_feeding_old = sum(count_feeding_old(sub_members_df)$n))%>%
+  mutate(n_moving_old = sum(count_moving_old(sub_members_df)$n))
+
+grpyr_df<-grpyr_df%>%
+  mutate(n_total_sample=n_total_sample_new+n_total_sample_old)%>%
+  mutate(n_feeding=n_feeding_old+n_feeding_new)%>%
+  mutate(n_moving=n_moving_old+n_moving_new)%>%
+  select(-n_total_sample_old,-n_feeding_old,-n_moving_old,-n_total_sample_new, -n_feeding_new, -n_moving_new)
+```
+
+
+#### 3.4 EDA
+
+## Scatterplot
+
+```{r}
+p1<-ggplot(data=grpyr_df, aes(x=n_adults, y=n_feeding/n_total_sample)) + geom_point()+labs(x = "Group Size", y="Proportion of Time Spent Feeding", title = "Relationship of group size vs. proportion of time spent feeding")+geom_smooth(method=lm, se=FALSE, col='blue')
+
+p2<-ggplot(data=grpyr_df, aes(x=net_density_wog_resid, y=n_feeding/n_total_sample)) + geom_point()+labs(x = "Network Density", y="Proportion of Time Spent Feeding", title = "Relationship of network density vs. proportion of time spent feeding")+geom_smooth(method=lm, se=FALSE, col='blue')
+
+p3<-ggplot(data=grpyr_df, aes(x=n_adults, y=n_moving/n_total_sample)) + geom_point()+labs(x = "Group Size", y="Proportion of Time Spent Moving", title = "Relationship of group size vs. proportion of time spent moving")+geom_smooth(method=lm, se=FALSE, col='blue')
+
+p4<-ggplot(data=grpyr_df, aes(x=net_density_wog_resid, y=n_moving/n_total_sample)) + geom_point()+labs(x = "Network Density", y="Proportion of Time Spent Moving", title = "Relationship of network density vs. proportion of time spent moving")+geom_smooth(method=lm, se=FALSE, col='blue')
+
+p2
+p4
+```
+
+
+## Histogram
+
+```{r}
+p3 <- ggplot(grpyr_df, aes(x=n_feeding/n_total_sample)) + geom_histogram(color="black", fill="white")+labs(x = "Age", title = "Distribution of proportion of time spent feeding")
+p4 <- ggplot(grpyr_df, aes(x=n_moving/n_total_sample)) + geom_histogram(color="black", fill="white")+labs(x = "Age", title = "Distribution of proportion of time spent moving")
+p3+p4
+```
+
+```{r}
+logis.model.feeding<-glmer(cbind(n_feeding, (n_total_sample-n_feeding)) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid), data=grpyr_df,family = "binomial"(link="logit"))
+#logistic regression
+summary(logis.model.feeding)
+# R squared
+# with(summary(logis.model.feeding), 1 - deviance/null.deviance)
+```
+
+```{r}
+logis.model.moving <- glmer(cbind(n_moving, (n_total_sample-n_feeding)) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid), data=grpyr_df,family = "binomial"(link="logit"))
+summary(logis.model.moving)
+#logistic regression
+```
+
+```{r}
+logis.model.feeding_per_moving <- glmer(cbind(n_feeding, n_moving) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid), data=grpyr_df,family = "binomial"(link="logit"))
+#logistic regression
+summary(logis.model.feeding_per_moving)
+```
+
+#### Model diagnostics
+
+```{r}
+simulationOutput <- simulateResiduals(fittedModel = logis.model.feeding_per_moving, n = 250)
+
+plot(simulationOutput) # Overall residual check
+testDispersion(simulationOutput) # Overdispersion check
+testUniformity(simulationOutput = simulationOutput) # Heteroscedasticity check
+testZeroInflation(simulationOutput) # Zero inflation check
+
+with(grpyr_df, plot(simulationOutput$scaledResiduals ~ n_adults))
+with(grpyr_df, plot(simulationOutput$scaledResiduals ~ net_density_wog))
+
+## odds ratios and 95% CI on odds ratio - if 95% CI on OR includes 1 the predictor is not sig
+exp(cbind(OR = coef(logis.model.feeding_per_moving), confint(logis.model.feeding_per_moving)))
+```
+
+#### Model Visualizations
+
+```{r}
+# Fill predicted values using regression model
+grpyr_df$outcome_m1 <- predict(logis.model.feeding, grpyr_df, type="response")
+# Plot Predicted data and original data points
+ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m1)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Predicted Outcome for Feeding Model")
+ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m1)) + geom_point()+labs(x = "Network Density", y="Outcome", title="Network Density vs. Predicted Outcome for Feeding Model")
+
+grpyr_df$outcome_m2 <- predict(logis.model.moving, grpyr_df, type="response")
+# Plot Predicted data and original data points
+ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m2)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Predicted Outcome for Moving Model")
+ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m2)) + geom_point()+labs(x = "Network Density", y="Outcome",  title="Network Density vs. Predicted Outcome for Moving Model")
+
+grpyr_df$outcome_m3 <- predict(logis.model.feeding_per_moving, grpyr_df, type="response")
+# Plot Predicted data and original data points
+ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m3)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Predicted Outcome for Feeding Per Moving Model")
+ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m3)) + geom_point()+labs(x = "Network Density", y="Outcome", title="Network Density vs. Predicted Outcome for Feeding Per Moving Model")
+
+## RAW outcomes
+grpyr_df<-grpyr_df%>%mutate(
+  raw_outcome_m1=n_feeding/n_total_sample,
+  raw_outcome_m2=n_feeding/n_total_sample,
+  raw_outcome_m3=n_feeding/n_moving,
+)
+
+ggplot(data=grpyr_df, aes(x=n_adults, y=raw_outcome_m1)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Raw Outcome for Feeding Model")
+ggplot(data=grpyr_df, aes(x=net_density_wog, y=raw_outcome_m1)) + geom_point()+labs(x = "Network Density", y="Outcome", title="Network Density vs. Raw Outcome for Feeding Model")
+ggplot(data=grpyr_df, aes(x=n_adults, y=raw_outcome_m2)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Raw Outcome for Moving Model")
+ggplot(data=grpyr_df, aes(x=net_density_wog, y=raw_outcome_m3)) + geom_point()+labs(x = "Network Density", y="Outcome",  title="Network Density vs. Raw Outcome for Moving Model")
+ggplot(data=grpyr_df, aes(x=n_adults, y=raw_outcome_m3)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Raw Outcome for Feeding Per Moving Model")
+ggplot(data=grpyr_df, aes(x=net_density_wog, y=raw_outcome_m3)) + geom_point()+labs(x = "Network Density", y="Outcome", title="Network Density vs. Raw Outcome for Feeding Per Moving Model")
+```
+
+
+
+### Model Diagonostics
+
+```{r}
+par(mfrow=c(2,2))
+plot(logis.model.feeding)
+```
+
+```{r}
+par(mfrow=c(2,2))
+plot(logis.model.moving)
+```
+
+```{r}
+par(mfrow=c(2,2))
+plot(logis.model.feeding_per_moving)
+```
+
