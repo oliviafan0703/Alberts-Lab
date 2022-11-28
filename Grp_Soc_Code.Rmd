@@ -71,7 +71,7 @@ babase <- DBI::dbConnect(RPostgreSQL::PostgreSQL(),
 
 ```{r}
 #Connect to source functions
-source("Functions.R") 
+source("Functions.R")
 
 # ---- LOAD DATAFRAMES ------------------------------------------------------
 
@@ -554,6 +554,62 @@ grpyr_df<-grpyr_df%>%
   
 ```
   
+
+#### 3.3.2 Food Efficiency Calculations
+
+```{r}
+ex_group<- grpyr_df[[15]][[18]]
+
+## WORKING WITH NEW POINTS DATA
+# total of point samples for a particular group year row
+foodcodes <- collect(tbl(babase, "foodcodes"))
+
+total_point_samples_gr_new<-function(sub_members_df){
+    sub_members_df%>%
+    left_join(samples, by="sname")%>%
+    left_join(points_new, by ="sid")%>%
+    filter(sex == "F")%>%
+    filter(date>start&date<end)
+}
+
+# time   spent  feeding on TTF
+# count_feeding_new<-function(sub_members_df){
+#     total_point_samples_gr_new(sub_members_df)%>%
+#     filter(foodcode=="TTF")%>%
+#     count()
+# }
+
+count_foodcode_new<-function(sub_members_df){
+    count_foodcode<-total_point_samples_gr_new(sub_members_df)%>%
+    group_by(foodcode)%>%
+    count()%>%
+    rename(fcode=foodcode)
+    
+    result<-count_foodcode%>%
+    left_join(foodcodes, by="fcode")%>%
+    ungroup%>%
+    select(ftype,n)%>%
+    group_by(ftype)%>%
+    summarise(n = sum(n),
+            .groups = 'drop')%>%
+    as.data.frame()
+    
+    result_by_col <- result%>%pivot_wider(names_from=ftype, values_from=n)
+    result_by_col
+}
+
+foodcount_ex<-count_foodcode_new(ex_group)
+foodcount_ex%>%pivot_wider(names_from=ftype, values_from=n)
+
+# count samples by food type in new dataframe
+
+grpyr_df<-grpyr_df%>%
+  rowwise()%>%
+  mutate(foodcode=list(count_foodcode_new(sub_members_df)))
+
+grpyr_df<-unnest(grpyr_df, foodcode)
+```
+
 
 #### 3.4 EDA
 
