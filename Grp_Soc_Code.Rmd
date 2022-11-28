@@ -154,9 +154,20 @@ groups <- groups_history_l %>%
                                         fifelse(is.na(last_reg_census) & !is.na(impermanent), as.Date(impermanent), as.Date("2022-06-29")))) #create date telling last time grp was a study grp
 
 #Create a start date for each group year
+groups <- groups %>%
+  mutate(startyear = fifelse(month(first_study_grp_census)==11 | month(first_study_grp_census)==12, as.numeric(format(first_study_grp_census,'%Y')) + 1, as.numeric(format(first_study_grp_census,'%Y'))))
+  
+groups$first_start <- as.Date(paste(groups$startyear, 11, 1), "%Y %m %d")
+
+#Create a start date for each group year - if you want to start each year on day group first censused
 start_dates <- groups %>%
   rowwise() %>%
-  do(data.frame(gid=.$gid, start=seq(.$first_study_grp_census,.$last_time_study_grp,by="1 year")))
+  do(data.frame(gid=.$gid, start=seq(.$first_start,.$last_time_study_grp,by="1 year")))
+
+#Create a start date for each group year - if you want to start each year on day group first censused
+#start_dates <- groups %>%
+#  rowwise() %>%
+#  do(data.frame(gid=.$gid, start=seq(.$first_study_grp_census,.$last_time_study_grp,by="1 year")))
 
 #Create group year df with start and end date for each year
 group_years <- groups %>%
@@ -164,6 +175,7 @@ group_years <- groups %>%
   mutate(end = start + years(1) - days(1),
          grp_year_length = end - start) %>%
   filter(end < last_time_study_grp) #end date can't occur after the last time the grp was a study grp
+
 
 ```
 
@@ -512,6 +524,36 @@ grpyr_df<-grpyr_df%>%
   select(-n_total_sample_old,-n_feeding_old,-n_moving_old,-n_total_sample_new, -n_feeding_new, -n_moving_new)
 ```
 
+#### 3.3 RAINFALL VARIABLES
+```{r}
+# ---- HYDRO YEAR ----------------------------------------------------------
+
+#Get hydroyear of start date
+grpyr_df<-grpyr_df%>%
+  mutate(hydroyear = get_hydroyear(start))
+
+# ---- RAINFALL ------------------------------------------------------------
+
+amb_rain <- collect(tbl(babase, "min_maxs"))
+
+# Take sum of measurements
+amb_rain <- amb_rain %>%
+  mutate(date_of = as.Date(wrdaytime)) %>%
+  group_by(date_of) %>%
+  summarise(rain = sum(rain, na.rm = TRUE)) 
+
+grpyr_df<-grpyr_df%>%
+  rowwise() %>%
+  mutate(
+    rain_normal = get_rain_normal(amb_rain, quo(date_of), quo(rain), start, end), 
+    rain_total = get_rain_total(amb_rain, quo(date_of), quo(rain), start, end), 
+    rain_anom_yr = rain_total - rain_normal, 
+    rain_avg = get_rain_avg(amb_rain, start, end), 
+    rain_div = get_rain_var(amb_rain, start, end)) %>%
+  ungroup()
+  
+```
+  
 
 #### 3.4 EDA
 
