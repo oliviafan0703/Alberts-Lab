@@ -175,8 +175,6 @@ group_years <- groups %>%
   mutate(end = start + years(1) - days(1),
          grp_year_length = end - start) %>%
   filter(end < last_time_study_grp) #end date can't occur after the last time the grp was a study grp
-
-
 ```
 
 #### 3. CALCULATE VARIABLES FOR ANALYSIS
@@ -580,17 +578,17 @@ cor(grpyr_df$rain_div,grpyr_df$pct_relative)
 
 ```{r}
 # VISUALIZATION
-ggplot(data=grpyr_df, aes(x=rain_div, y=pct_feeding)) + geom_point()+labs(x = "Rainfall Diversity", y="Proportion of Time Spent Feeding", title = "Relationship of rainfall diversity vs. proportion of time spent feeding")+geom_smooth(method=lm, se=FALSE, col='blue')
+ggplot(data=grpyr_df, aes(x=rain_avg, y=pct_feeding)) + geom_point()+labs(x = "Average Rainfall", y="Proportion of Time Spent Feeding", title = "Relationship of average rainfall vs. proportion of time spent feeding")+geom_smooth(method=lm, se=FALSE, col='blue')
 
-ggplot(data=grpyr_df, aes(x=rain_div, y=pct_moving)) + geom_point()+labs(x = "Rainfall Diversity", y="Proportion of Time Spent Moving", title = "Relationship of  rainfall diversity vs. proportion of time spent feeding")+geom_smooth(method=lm, se=FALSE, col='blue')
+ggplot(data=grpyr_df, aes(x=rain_avg, y=pct_moving)) + geom_point()+labs(x = "Average Rainfall", y="Proportion of Time Spent Moving", title = "Relationship of average rainfall vs. proportion of time spent moving")+geom_smooth(method=lm, se=FALSE, col='blue')
 
-ggplot(data=grpyr_df, aes(x=rain_div, y=pct_relative)) + geom_point()+labs(x = "Rainfall Diversity", y="Proportion of Time Spent Feeding Rel to Moving", title = "Relationship of  rainfall diversity vs. proportion of time spent feeding relative to moving")+geom_smooth(method=lm, se=FALSE, col='blue')
+ggplot(data=grpyr_df, aes(x=rain_avg, y=pct_relative)) + geom_point()+labs(x = "Average Rainfall", y="Proportion of Time Spent Feeding Rel to Moving", title = "Relationship of average rainfall vs. proportion of time spent feeding relative to moving")+geom_smooth(method=lm, se=FALSE, col='blue')
 ```
 
 #### 3.5 Food Efficiency Calculations
 
 ```{r}
-ex_group<- grpyr_df[[15]][[18]]
+# ex_group<- grpyr_df[[15]][[18]]
 
 foodcodes <- collect(tbl(babase, "foodcodes"))
 
@@ -628,9 +626,9 @@ count_foodcode_new<-function(sub_members_df){
     result_by_col <- result%>%pivot_wider(names_from=ftype, values_from=n)
     result_by_col
 }
-
-foodcount_ex<-count_foodcode_new(ex_group)
-foodcount_ex%>%pivot_wider(names_from=ftype, values_from=n)
+# 
+# foodcount_ex<-count_foodcode_new(ex_group)
+# foodcount_ex%>%pivot_wider(names_from=ftype, values_from=n)
 
 # count samples by food type in new dataframe
 
@@ -640,7 +638,7 @@ foodcount_ex%>%pivot_wider(names_from=ftype, values_from=n)
 ```
 
 ```{r}
-old_group<- grpyr_df[[15]][[9]]
+# old_group<- grpyr_df[[15]][[9]]
 
 ## WORKING WITH OLD POINTS DATA
 total_point_samples_gr_old<-function(sub_members_df){
@@ -649,13 +647,6 @@ total_point_samples_gr_old<-function(sub_members_df){
     filter(sex == "F")%>%
     filter(date>start&date<end)
 }
-
-# time   spent  feeding on TTF
-# count_feeding_new<-function(sub_members_df){
-#     total_point_samples_gr_new(sub_members_df)%>%
-#     filter(foodcode=="TTF")%>%
-#     count()
-# }
 
 count_foodcode_old<-function(sub_members_df){
     count_foodcode<-total_point_samples_gr_old(sub_members_df)%>%
@@ -684,13 +675,12 @@ count_foodcode_old<-function(sub_members_df){
 # combine old and new info
 grpyr_df<-grpyr_df%>%
   rowwise()%>%
-  mutate(foodtype=ifelse(permanent>as.Date('1999-01-01'),list(count_foodcode_new(sub_members_df)),list(count_foodcode_old(sub_members_df))))
+  mutate(foodtype=ifelse(start>as.Date('1999-01-01'),list(count_foodcode_new(sub_members_df)),list(count_foodcode_old(sub_members_df))))
 
-
-## NEED DEBUGGING
-grpyr_df<-grpyr_df%>%unnest(foodtype)
+# got the final dataframe with food types
+grpyr_df<-grpyr_df%>%
+  unnest(foodtype, names_repair = "minimal")
 ```
-
 
 #### 3.6 EDA
 
@@ -719,7 +709,7 @@ p3+p4
 ```
 
 ```{r}
-logis.model.feeding<-glmer(cbind(n_feeding, (n_total_sample-n_feeding)) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid)+(1|hydroyear), data=grpyr_df,family = "binomial"(link="logit"))
+logis.model.feeding<-glmer(cbind(n_feeding, (n_total_sample-n_feeding)) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid)+(1|hydroyear)+(1|rain_avg), data=grpyr_df,family = "binomial"(link="logit"))
 #logistic regression
 summary(logis.model.feeding)
 # R squared
@@ -727,13 +717,13 @@ summary(logis.model.feeding)
 ```
 
 ```{r}
-logis.model.moving <- glmer(cbind(n_moving, (n_total_sample-n_feeding)) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid), data=grpyr_df,family = "binomial"(link="logit"))
+logis.model.moving <- glmer(cbind(n_moving, (n_total_sample-n_feeding)) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid)+(1|hydroyear)+(1|rain_avg), data=grpyr_df,family = "binomial"(link="logit"))
 summary(logis.model.moving)
 #logistic regression
 ```
 
 ```{r}
-logis.model.feeding_per_moving <- glmer(cbind(n_feeding, n_moving) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid), data=grpyr_df,family = "binomial"(link="logit"))
+logis.model.feeding_per_moving <- glmer(cbind(n_feeding, n_moving) ~ scale(n_adults)+scale(net_density_wog)+ (1|gid)+(1|hydroyear)+(1|rain_avg), data=grpyr_df,family = "binomial"(link="logit"))
 #logistic regression
 summary(logis.model.feeding_per_moving)
 ```
