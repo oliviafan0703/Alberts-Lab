@@ -589,7 +589,6 @@ ggplot(data=grpyr_df, aes(x=rain_avg, y=pct_relative)) + geom_point()+labs(x = "
 
 ```{r}
 # ex_group<- grpyr_df[[15]][[18]]
-
 foodcodes <- collect(tbl(babase, "foodcodes"))
 
 ## WORKING WITH NEW POINTS DATA
@@ -626,15 +625,15 @@ count_foodcode_new<-function(sub_members_df){
     result_by_col <- result%>%pivot_wider(names_from=ftype, values_from=n)
     result_by_col
 }
-# 
+
 # foodcount_ex<-count_foodcode_new(ex_group)
 # foodcount_ex%>%pivot_wider(names_from=ftype, values_from=n)
 
 # count samples by food type in new dataframe
 
-# grpyr_df<-grpyr_df%>%
-#   rowwise()%>%
-#   mutate(foodtype_new=list(count_foodcode_new(sub_members_df)))
+grpyr_df<-grpyr_df%>%
+  rowwise()%>%
+  mutate(foodtype_new=list(count_foodcode_new(sub_members_df)))
 ```
 
 ```{r}
@@ -667,18 +666,27 @@ count_foodcode_old<-function(sub_members_df){
     result_by_col
 }
 
-# grpyr_df<-grpyr_df%>%
-#   rowwise()%>%
-#   mutate(foodtype_old=list(count_foodcode_old(sub_members_df)))
-
-# COMBINED
-# combine old and new info
 grpyr_df<-grpyr_df%>%
   rowwise()%>%
-  mutate(foodtype=ifelse(start>as.Date('1999-01-01'),list(count_foodcode_new(sub_members_df)),list(count_foodcode_old(sub_members_df))))
+  mutate(foodtype_old=list(count_foodcode_old(sub_members_df)))
 
-# got the final dataframe with food types
+
+# COMBINE OLD AND NEW TYPE DATA
+combine_old_new<-function(a,b){
+    union_all(a,b)%>%
+    summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)))
+}
+
+# TEST CODE (find the union between two dataframes)
+# a<-grpyr_df[[30]][[67]]
+# b<-grpyr_df[[30]][[72]]
+# 
+# union_all(a,b)%>%
+#     summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)))
+
 grpyr_df<-grpyr_df%>%
+  rowwise()%>%
+  mutate(foodtype=list(combine_old_new(foodtype_old,foodtype_new)))%>%
   unnest(foodtype, names_repair = "minimal")
 ```
 
