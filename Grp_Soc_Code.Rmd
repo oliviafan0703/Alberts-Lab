@@ -775,6 +775,9 @@ library(ggplot2)
 # Stacked
 ggplot(df, aes(fill=type, y=value, x=Quantile)) + 
     geom_bar(position="stack", stat="identity")
+
+ggplot(df, aes(fill=type, y=value, x=Quantile)) + 
+    geom_bar(position="fill", stat="identity")
 ```
 
 #### 3.6 EDA
