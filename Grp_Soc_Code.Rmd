@@ -2433,3 +2433,23 @@ rownames(citab) <- rownames(cc)
 
 
 ```
+
+#### Distribution by group ID
+
+```{r}
+ggplot(grpyr_df, aes(x=n_adults, fill=as.factor(gid))) + 
+  geom_histogram() + 
+  labs(title="Distribution of Group Size Grouped by Group", x="Group Size", y="Frequency",fill = "Group ID")
+
+ggplot(grpyr_df, aes(x=net_density_wog_resid, fill=as.factor(gid))) + 
+  geom_histogram() + 
+  labs(title="Distribution of Network Density Grouped by Group", x="Network Density", y="Frequency",fill = "Group ID")
+
+ggplot(grpyr_df, aes(x=pct_feeding, fill=as.factor(gid))) + 
+  geom_histogram() + 
+  labs(title="Distribution of Proportion Time Feeding Grouped by Group", x="Proportion Time Feeding", y="Frequency",fill = "Group ID")
+
+ggplot(grpyr_df, aes(x=pct_moving, fill=as.factor(gid))) + 
+  geom_histogram() + 
+  labs(title="Distribution of Proportion Time Moving Grouped by Group", x="Proportion Time Moving", y="Frequency",fill = "Group ID")
+```
