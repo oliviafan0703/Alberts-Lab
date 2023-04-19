@@ -42,6 +42,7 @@ babase <- DBI::dbConnect(RPostgreSQL::PostgreSQL(),
 ```{r}
 #Connect to source functions
 source("Functions.R")
+#source("ugee.R")
 
 # ---- LOAD DATAFRAMES ------------------------------------------------------
 library(ramboseli)
@@ -65,6 +66,11 @@ groups_history_l <- collect(tbl(babase, "groups_history"))
 maturedates_l <- collect(tbl(babase, "maturedates"))
 #Get local copy of rankdates
 rankdates_l <- collect(tbl(babase, "rankdates"))
+#Get local copy of samples
+samples_goff_l <- collect(tbl(babase, "samples_goff"))
+
+#Get a local version of members with behave gaps included
+members_l3 <- collect(tbl(babase, "members"))
 
 # ---- JOIN DATAFRAMES ------------------------------------------------------
 #Create connection version
@@ -278,9 +284,26 @@ grpyr_df <- grpyr_df %>%
 grpyr_df <- grpyr_df %>%
   mutate(n_members = sapply(sub_all_members_df, NROW))
 
-#Join grpyr_df to subjects on mom_sname and end date
+#Join grpyr_df to subjects group_years by gid and end date
 group_years <- group_years %>%
   left_join(select(grpyr_df, gid, end, n_members), by = c("gid", "end"))
+
+
+# ---- GRP SIZE ONLY FEMALES -------------------------------------------------------
+
+#Subset members
+grpyr_df <- grpyr_df %>% 
+  rowwise() %>% 
+  mutate(sub_females_df = list(subset_female_membership(gid, start, end))) %>% 
+  ungroup()
+
+#Count number of adult females in group >= 183 days to get group size
+grpyr_df <- grpyr_df %>%
+  mutate(n_females = sapply(sub_females_df, NROW))
+
+#Join grpyr_df to subjects group_years by gid and end date
+group_years <- group_years %>%
+  left_join(select(grpyr_df, gid, end, n_females), by = c("gid", "end"))
 
 ```
 
@@ -290,18 +313,18 @@ group_years <- group_years %>%
 # ---- OBSERVER EFFORT ------------------------------------------------------
 #After 1999-10-04
 #Grp focal minutes per adult
-adult_focals <- samples_goff %>%
+adult_focals <- samples_goff_l %>%
   filter(grp_of_focal < 3 & grp_of_focal != 1.3) %>%
-  inner_join(select(biograph, sname, sex), by = "sname") %>%
-  left_join(select(md_females, sname, matured), by = "sname") %>%
-  left_join(select(rd_males, sname, ranked), by = "sname") %>%
+  inner_join(select(biograph_l, sname, sex), by = "sname") %>%
+  left_join(select(md_females_l, sname, matured), by = "sname") %>%
+  left_join(select(rd_males_l, sname, ranked), by = "sname") %>%
   filter((sex == "F" & date >= matured) | (sex == "M" & date >= ranked)) %>%
   collect()
 
 #Join to subjects - zeros because no focal data in samples_goff before 1999-10-04
 group_years <- group_years %>%
   rowwise() %>%
-  mutate(grp_focal_mins_post1999=get_focal_mins(adult_focals, start, end, gid))
+  mutate(focals_post1999=get_focals(adult_focals, start, end, gid))
 
 #Before 1999-10-04 - Note: there are some imperfections in these data in babase
 # Database connections
@@ -325,17 +348,14 @@ samples_pre1999 <- bind_rows(select(a1, -mpos),
                   select(h1, -mpos),
                   select(h2, -mpos))
 
-#Create local version of members with behave gaps included
-members_l3 <- collect(tbl(babase, "members"))
-
 #Focal minute totals for individuals each hour
-adult_focals_pre1999 <- samples_pre1999 %>%
+focals_pre1999 <- samples_pre1999 %>%
   group_by(sname, date, time) %>%
   tally() %>%
   ungroup()
 
-#Grp focal minutes per adult
-adult_focals_pre1999 <- adult_focals_pre1999 %>%
+#Grp focals per adult
+adult_focals_pre1999 <- focals_pre1999 %>%
   left_join(select(members_l3, sname, date, "grp_of_focal" = "grp"), by = c("sname", "date")) %>%
   filter(grp_of_focal < 3 & grp_of_focal != 1.3) 
 adult_focals_pre1999 <- adult_focals_pre1999 %>%
@@ -349,19 +369,45 @@ adult_focals_pre1999 <- adult_focals_pre1999 %>%
 #Join to subjects - focal data from before 1999-10-04
 group_years <- group_years %>%
   rowwise() %>%
-  mutate(grp_focal_mins_pre1999=get_focal_mins(adult_focals_pre1999, start, end, gid))
+  mutate(focals_pre1999=get_focals(adult_focals_pre1999, start, end, gid))
 
 #Calculate group observation effort
 group_years <- group_years %>%
-  mutate(obs_effort = ifelse(start < as.Date("1999-10-04"), as.numeric(grp_focal_mins_pre1999)/n_adults, as.numeric(grp_focal_mins_post1999)/n_adults)) 
+  mutate(obs_effort = (focals_pre1999+focals_post1999)/n_adults)
 grpyr_df<-grpyr_df%>%
   dplyr::left_join(select(group_years, "gid", "start", "obs_effort"), by = c("gid", "start"))
+
+#Calculate group observation effort (with females)
+group_years <- group_years %>%
+  mutate(obs_effort_females = (focals_pre1999+focals_post1999)/n_females)
+grpyr_df<-grpyr_df%>%
+  dplyr::left_join(select(group_years, "gid", "start", "obs_effort_females"), by = c("gid", "start"))
+
+# ---- HOURS OBSERVED -------------------------------------------------------------
+
+#Get monthly summaries
+data_summary_monthly <- tbl(babase, in_schema("babase_pending", "data_summary_monthly")) %>%
+  collect()
+
+#Join monthly summaries to group years and filter those months not in each year of interest
+monthy_summaries <- grpyr_df %>%
+  dplyr::left_join(select(data_summary_monthly, "grp", "date_month", "hours_observed", "indivs"), by = c("gid" = "grp")) %>%
+  filter(start <= date_month & date_month <= end)
+
+yearly_summaries <- monthy_summaries %>%
+  group_by(gid, start) %>%
+  summarise(hours_observed_yr = sum(hours_observed, na.rm = TRUE)) %>%
+  ungroup()
+
+grpyr_df <- grpyr_df %>%
+  dplyr::left_join(yearly_summaries, by = c("gid", "start"))
 
 # ---- CREATE RESIDUAL NETWORK DENSITY --------------------------------------------
 #NOTE: This does not run because some individuals get NAs for observer effort - we need to look into why this is
 #Make residual net density residuals
 l1<- lm(scale(log(net_density_wog))~scale(log(obs_effort)),data=grpyr_df)
 grpyr_df$net_density_wog_resid<- resid(l1)
+
 #Group size vs network density
 ggplot(grpyr_df, aes(x=n_adults, y=net_density_wog_resid)) +
       geom_point(size = 2.0, alpha = 0.7, colour="violetred4") +
@@ -387,42 +433,42 @@ ggplot(grpyr_df, aes(x=net_density_wog, y=obs_effort)) +
       geom_smooth(method=lm, colour="black", size=0.5)
 p1.m <- lm(net_density_wog_resid ~ n_adults, data=grpyr_df)
 
+
+
+##TEST WITH FEMALES
+
+#l2<- lm(scale(log(net_density_wog))~scale(log(obs_effort_females)),data=grpyr_df)
+#grpyr_df$net_density_wog_resid<- resid(l1)
+
+#Network density vs observer effort with females
+#ggplot(grpyr_df, aes(x=net_density_wog, y=obs_effort_females)) +
+#      geom_point(size = 2.0, alpha = 0.7, colour="violetred4") +
+#      theme_cowplot() +
+#      ylab("Observer effort (denominator females only)") +
+#      xlab("Network density") +
+#      geom_smooth(method=lm, colour="black", size=0.5)
+#p1.m <- lm(net_density_wog_resid ~ n_adults, data=grpyr_df)
+
 ```
 
 #### 3.3 CALCULATE FORAGING EFFICIENCY
 
 ```{r}
-# CALCULATE POINT SAMPLES
-# Point sample data are in the old formats in babase_pending
-# In four different tables, which oddly have different column names
-# for proximity columns (so rename below)
-a1 <- tbl(babase, in_schema("babase_pending", "altos_points_84to96mar3")) %>%
-  collect()
-names(a1)[6:8] <- c("nn", "n1", "n2")
-a1$n2 <- str_trim(a1$n2)
-a2 <- tbl(babase, in_schema("babase_pending", "altos_points_96marto99")) %>%
-  collect()
-names(a2)[6:8] <- c("nn", "n1", "n2")
-h1 <- tbl(babase, in_schema("babase_pending", "hooks_points_84to96")) %>%
-  collect()
-names(h1)[6:8] <- c("nn", "n1", "n2")
-h2 <- tbl(babase, in_schema("babase_pending", "hooks_points_96to99")) %>%
-  collect()
-names(h2)[6:8] <- c("nn", "n1", "n2")
-
-# Combine into one
+# Combine old point samples in one dataframe
 points_old <- bind_rows(select(a1, -mpos),
                         select(a2, -mpos),
                         select(h1, -mpos),
                         select(h2, -mpos))
+
+# ex_group<- grpyr_df[[13]][[1]]
+# ex_group$start[1]
+# ex_group$end[1]
+
 #Get local copy of points after 1999
 points_new <- collect(tbl(babase, "point_data"))
 biograph <-collect(tbl(babase, "biograph"))
 members <- collect(tbl(babase, "members"))
 samples <- collect(tbl(babase, "samples"))
-# ex_group<- grpyr_df[[13]][[1]]
-# ex_group$start[1]
-# ex_group$end[1]
 
 ## WORKING WITH NEW POINTS DATA
 # total of point samples for a particular group year row
@@ -685,15 +731,14 @@ grpyr_df<-grpyr_df%>%
   mutate(foodtype_old=list(count_foodcode_old(sub_members_df)))
 # COMBINE OLD AND NEW TYPE DATA
 combine_old_new<-function(a,b){
-    union_all(a,b)%>%
+    rbind.fill(a,b)%>%
     summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)))
 }
 # TEST CODE (find the union between two dataframes)
-# a<-grpyr_df[[30]][[67]]
-# b<-grpyr_df[[30]][[72]]
+# a<-grpyr_df[[41]][[9]]
+# b<-grpyr_df[[42]][[7]]
+# rbind.fill(a,b)
 # 
-# union_all(a,b)%>%
-#     summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)))
 grpyr_df<-grpyr_df%>%
   rowwise()%>%
   mutate(foodtype=list(combine_old_new(foodtype_old,foodtype_new)))%>%
@@ -704,7 +749,7 @@ grpyr_df<-grpyr_df%>%
 #NVR (invertebrate), EDJ (elephant dung), GAR (garbage), VRT (vertebrates), WAX (water)
 # ex_group<- grpyr_df[[15]][[18]]
 select.me<-c('NVR','EDJ','GAR','VRT','WAX')
-  
+
 count_additionalfc_new<-function(sub_members_df){
     results<-total_point_samples_gr_new(sub_members_df)%>%
     group_by(foodcode)%>%
@@ -733,7 +778,7 @@ grpyr_df<-grpyr_df%>%
   mutate(additionalfc_old=list(count_additionalfc_old(sub_members_df)))
 # COMBINE OLD AND NEW ADDITIONAL DATA
 combine_additional<-function(a,b){
-    union_all(a,b)%>%
+    rbind.fill(a,b)%>%
     summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)))
 }
 grpyr_df<-grpyr_df%>%
@@ -743,9 +788,39 @@ grpyr_df<-grpyr_df%>%
 grpyr_df<-grpyr_df%>% select(-foodtype_new,-foodtype_old,-additionalfc_old,-additionalfc_new)
 
 
+```
+
+#### 3.6 PREMLIMINARY DATA VISUALIZATIONS
+
+```{r}
+# ---- CREATE DATASET WITHOUT PRE-1999 DATA ------------------------------
+
+#Eliminate years before food type data was available
+grpyr_df_post2000 <- grpyr_df %>%
+  subset(start > as.Date("2000-01-01"))
+
+#Replace NAs for feeding counts with zeros
+grpyr_df_post2000 <- grpyr_df_post2000 %>%
+  mutate(B=ifelse(is.na(B), 0, B),
+         C=ifelse(is.na(C), 0, C),
+         D=ifelse(is.na(D), 0, D),
+         F=ifelse(is.na(F), 0, F),
+         G=ifelse(is.na(G), 0, G),
+         K=ifelse(is.na(K), 0, K),
+         L=ifelse(is.na(L), 0, L),
+         O=ifelse(is.na(O), 0, O),
+         P=ifelse(is.na(P), 0, P),
+         T=ifelse(is.na(T), 0, T),
+         NVR=ifelse(is.na(NVR), 0, NVR),
+         WAX=ifelse(is.na(WAX), 0, WAX),
+         EDJ=ifelse(is.na(EDJ), 0, EDJ)) %>%
+  mutate(HighEnFoods=D+G+F)
+
+# ---- FOOD TYPE BY GROUP SIZE AND NETWORK DENSITY -----------------------
+
 ### Food type bar plot by group size
 grpyr_df_ordered<-grpyr_df[order(grpyr_df$n_adults, decreasing = TRUE),]
-grpyr_df_ordered<-grpyr_df_ordered[17:54]
+grpyr_df_ordered<-grpyr_df_ordered[17:58]
 grpyr_df_ordered<-grpyr_df_ordered%>%
   select(-net_density_wog,-obs_effort,-net_density_wog_resid,-n_total_sample,-n_feeding,-n_moving,-hydroyear,-rain_normal,-rain_total,-rain_anom_yr,-rain_avg,-rain_div,-pct_feeding)%>%
   
@@ -791,7 +866,7 @@ ggplot(df, aes(fill=type, y=value, x=Quantile)) +
 
 ### Food type bar plot by network density
 grpyr_df_ordered<-grpyr_df[order(grpyr_df$net_density_wog_resid, decreasing = TRUE),]
-grpyr_df_ordered<-grpyr_df_ordered[17:54]
+grpyr_df_ordered<-grpyr_df_ordered[17:58]
 grpyr_df_ordered<-grpyr_df_ordered%>%
   select(-n_adults,-obs_effort,net_density_wog,-n_total_sample,-n_feeding,-n_moving,-hydroyear,-rain_normal,-rain_total,-rain_anom_yr,-rain_avg,-rain_div,-pct_feeding)%>%
   
@@ -812,7 +887,7 @@ df<-df%>%pivot_longer(c(B,C,D,'F',G,K,L,O,P, 'T',X,R,NVR,WAX,EDJ,GAR,VRT), names
 
 # Stacked
 ggplot(df, aes(fill=type, y=value, x=Quantile)) + 
-    geom_bar(position="stack", stat="identity")
+    geom_bar(position="stack", stat="identity") +
     theme_cowplot() +
     ylab("total point samples") +
     xlab("network density resid quantile") +
@@ -833,11 +908,7 @@ ggplot(df, aes(fill=type, y=value, x=Quantile)) +
       legend.key.width = unit(0.5, 'cm'),
       legend.title = element_text(size=12),
       legend.text = element_text(size=12))
-```
 
-#### 3.6 PREMLIMINARY DATA VISUALIZATIONS
-
-```{r}
 # ---- ADD OLRE AND POST-1999 VARIABLES -----------------------------------
 grpyr_df$id <- seq.int(nrow(grpyr_df))
 
@@ -851,16 +922,133 @@ dotchart(grpyr_df$n_feeding, xlab = "Count feeding",
 dotchart(grpyr_df$pct_feeding, xlab = "Proportion feeding",
          ylab = "Order of data", labels = F)
 
+# ---- DISTRIBUTIONS BY GROUP ID -------------------------------------------
+ggplot(grpyr_df, aes(x=n_adults, fill=as.factor(gid))) + 
+  geom_histogram() + 
+  labs(title="Distribution of Group Size Grouped by Group", x="Group Size", y="Frequency",fill = "Group ID")
+ggplot(grpyr_df, aes(x=net_density_wog_resid, fill=as.factor(gid))) + 
+  geom_histogram() + 
+  labs(title="Distribution of Network Density Grouped by Group", x="Network Density Residuals", y="Frequency",fill = "Group ID")
+ggplot(grpyr_df, aes(x=pct_feeding, fill=as.factor(gid))) + 
+  geom_histogram() + 
+  labs(title="Distribution of Proportion Time Feeding Grouped by Group", x="Proportion Time Feeding", y="Frequency",fill = "Group ID")
+ggplot(grpyr_df, aes(x=pct_moving, fill=as.factor(gid))) + 
+  geom_histogram() + 
+  labs(title="Distribution of Proportion Time Moving Grouped by Group", x="Proportion Time Moving", y="Frequency",fill = "Group ID")
+
+# ---- WEIGHT VS PREDICTORS ------------------------------------------------
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=n_total_sample, color=as.character(gid))) + geom_point() + labs(x = "Number of Adults", y="Total # Samples", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=n_total_sample, color=as.character(gid))) + geom_point() + labs(x = "Number of Members", y="Total # Samples", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog_resid, y=n_total_sample, color=as.character(gid))) + geom_point() + labs(x = "Network Density (controlled \nusing avg # fem focals)", y="Total # Samples", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+#Calculate network density residuals with hours observed
+l1<- lm(scale(log(net_density_wog))~scale(log(hours_observed_yr)),data=grpyr_df)
+grpyr_df$net_density_wog_resid2<- resid(l1)
+
+p4 <- ggplot(data=grpyr_df, aes(x=net_density_wog_resid2, y=n_total_sample, color=as.character(gid))) + geom_point() + labs(x = "Network Density (controlled \nusing hour grp observed)", y="Total # Samples", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
 # ---- CORRELATION PLOTS ---------------------------------------------------
-ggplot(data=grpyr_df, aes(x=n_adults, y=n_feeding/n_total_sample)) + geom_point()+labs(x = "Group Size", y="Proportion of Time Spent Feeding", title = "Relationship of group size vs. proportion of time spent feeding")+geom_smooth(method=lm, se=FALSE, col='blue')
-ggplot(data=grpyr_df, aes(x=net_density_wog_resid, y=n_feeding/n_total_sample)) + geom_point()+labs(x = "Network Density", y="Proportion of Time Spent Feeding", title = "Relationship of network density vs. proportion of time spent feeding")+geom_smooth(method=lm, se=FALSE, col='blue')
-ggplot(data=grpyr_df, aes(x=n_adults, y=n_moving/n_total_sample)) + geom_point()+labs(x = "Group Size", y="Proportion of Time Spent Moving", title = "Relationship of group size vs. proportion of time spent moving")+geom_smooth(method=lm, se=FALSE, col='blue')
-ggplot(data=grpyr_df, aes(x=net_density_wog_resid, y=n_moving/n_total_sample)) + geom_point()+labs(x = "Network Density", y="Proportion of Time Spent Moving", title = "Relationship of network density vs. proportion of time spent moving")+geom_smooth(method=lm, se=FALSE, col='blue')
+#Time spent feeding
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=n_feeding/n_total_sample, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Prop Time \nSpent Feeding", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=n_feeding/n_total_sample, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Prop Time \nSpent Feeding", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog, y=n_feeding/n_total_sample, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Prop Time \nSpent Feeding", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df, aes(x=rain_avg, y=n_feeding/n_total_sample, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Prop Time \nSpent Feeding", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+#Time spent moving
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=n_moving/n_total_sample, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Prop Time \nSpent Moving", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=n_moving/n_total_sample, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Prop Time \nSpent Moving", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog, y=n_moving/n_total_sample, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Prop Time \nSpent Moving", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df, aes(x=rain_avg, y=n_moving/n_total_sample, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Prop Time \nSpent Moving", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+#Time spent feeding relative to moving
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=n_feeding/n_feeding+n_moving, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Prop Time Feeding \nRelative to Foraging", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=n_feeding/n_feeding+n_moving, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Prop Time Feeding \nRelative to Foraging", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog, y=n_feeding/n_feeding+n_moving, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Prop Time Feeding \nRelative to Foraging" , title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df, aes(x=rain_avg, y=n_feeding/n_feeding+n_moving, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Prop Time Feeding \nRelative to Foraging" , title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+#Feeding time spent on corms
+p1 <- ggplot(data=grpyr_df_post2000, aes(x=n_adults, y=C/n_feeding, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Prop Feeding Time \nSpent on Corms", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p2 <- ggplot(data=grpyr_df_post2000, aes(x=n_members, y=C/n_feeding, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Prop Feeding Time \nSpent on Corms", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df_post2000, aes(x=net_density_wog, y=C/n_feeding, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Prop Feeding Time \nSpent on Corms", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df_post2000, aes(x=rain_avg, y=C/n_feeding, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Prop Feeding Time \nSpent on Corms", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+#Feeding time spent on high energy foods
+p1 <- ggplot(data=grpyr_df_post2000, aes(x=n_adults, y=HighEnFoods/n_feeding, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Prop Feeding Time \nSpent on High \nEnergy Foods", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p2 <- ggplot(data=grpyr_df_post2000, aes(x=n_members, y=HighEnFoods/n_feeding, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Prop Feeding Time \nSpent on High \nEnergy Foods", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df_post2000, aes(x=net_density_wog, y=HighEnFoods/n_feeding, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Prop Feeding Time \nSpent on High \nEnergy Foods", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df_post2000, aes(x=rain_avg, y=HighEnFoods/n_feeding, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Prop Feeding Time \nSpent on High \nEnergy Foods", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
 
 # ---- HISTOGRAMS ----------------------------------------------------------
 p3 <- ggplot(grpyr_df, aes(x=n_feeding/n_total_sample)) + geom_histogram(color="black", fill="white")+labs(x = "Prop time feeding", title = "Distribution of proportion of time spent feeding")
 p4 <- ggplot(grpyr_df, aes(x=n_moving/n_total_sample)) + geom_histogram(color="black", fill="white")+labs(x = "Prop time moving", title = "Distribution of proportion of time spent moving")
 p3+p4
+
 
 ```
 
@@ -876,9 +1064,9 @@ logis.model.feeding<-glmer(cbind(n_feeding, (n_total_sample-n_feeding)) ~ scale(
                                                                           #I(scale(n_adults)^2) +
                                                                           #poly(n_adults, 2) +
                                                                           #scale(net_density_wog_resid) +
-                                                                          scale(net_density_wog) +
+                                                                          scale(net_density_wog_resid) +
                                                                           #I(scale(net_density_wog)^2) 
-                                                                          #poly(net_density_wog, 2) +
+                                                                          #poly(net_density_wog_resid, 2) +
                                                                           #scale(n_adults)*scale(net_density_wog) +
                                                                           scale(obs_effort) +
                                                                           scale(rain_avg) +
@@ -895,7 +1083,7 @@ summary(logis.model.feeding)
 
 library(jtools)
 effect_plot(logis.model.feeding, pred = n_adults, interval = TRUE)
-effect_plot(logis.model.feeding, pred = net_density_wog, interval = TRUE)
+effect_plot(logis.model.feeding, pred = net_density_wog_resid, interval = TRUE)
 effect_plot(logis.model.feeding, pred = obs_effort, interval = TRUE)
 effect_plot(logis.model.feeding, pred = rain_avg, interval = TRUE)
 effect_plot(logis.model.feeding, pred = post1999, interval = TRUE)
@@ -905,7 +1093,7 @@ effect_plot(logis.model.feeding, pred = post1999, interval = TRUE)
 logis.model.moving<-glmer(cbind(n_moving, (n_total_sample-n_moving)) ~ scale(n_adults) +
                                                                         #I(scale(sqrt(n_adults))^2) +
                                                                         #poly(n_adults, 2) +
-                                                                        scale(net_density_wog) +
+                                                                        scale(net_density_wog_resid) +
                                                                         #poly(net_density_wog, 2) +
                                                                         #I(scale(sqrt(net_density_wog))^2) +
                                                                         #scale(n_adults)*scale(net_density_wog) +
@@ -926,7 +1114,7 @@ summary(logis.model.moving)
 
 library(jtools)
 effect_plot(logis.model.moving, pred = n_adults, interval = TRUE)
-effect_plot(logis.model.moving, pred = net_density_wog, interval = TRUE)
+effect_plot(logis.model.moving, pred = net_density_wog_resid, interval = TRUE)
 effect_plot(logis.model.moving, pred = obs_effort, interval = TRUE)
 effect_plot(logis.model.moving, pred = rain_avg, interval = TRUE)
 effect_plot(logis.model.moving, pred = post1999, interval = TRUE)
@@ -937,7 +1125,7 @@ effect_plot(logis.model.moving, pred = post1999, interval = TRUE)
 logis.model.feeding_per_moving<-glmer(cbind(n_feeding, n_moving) ~ scale(n_adults) +
                                                                    #I(scale(n_adults)^2) +
                                                                    #poly(n_adults, 2) +
-                                                                   scale(net_density_wog) +
+                                                                   scale(net_density_wog_resid) +
                                                                    #I(scale(net_density_wog)^2) +
                                                                    #poly(net_density_wog, 3) +
                                                                    #scale(n_adults)*scale(net_density_wog) +
@@ -956,7 +1144,7 @@ summary(logis.model.feeding_per_moving)
 
 library(jtools)
 effect_plot(logis.model.feeding_per_moving, pred = n_adults, interval = TRUE)
-effect_plot(logis.model.feeding_per_moving, pred = net_density_wog, interval = TRUE)
+effect_plot(logis.model.feeding_per_moving, pred = net_density_wog_resid, interval = TRUE)
 effect_plot(logis.model.feeding_per_moving, pred = obs_effort, interval = TRUE)
 effect_plot(logis.model.feeding_per_moving, pred = rain_avg, interval = TRUE)
 effect_plot(logis.model.feeding_per_moving, pred = post1999, interval = TRUE)
@@ -969,8 +1157,8 @@ plot(simulationOutput) # Overall residual check
 testDispersion(simulationOutput) # Overdispersion check
 testUniformity(simulationOutput = simulationOutput) # Heteroscedasticity check
 testZeroInflation(simulationOutput) # Zero inflation check
-with(grpyr_df, plot(simulationOutput$scaledResiduals ~ scale(n_members)))
-with(grpyr_df, plot(simulationOutput$scaledResiduals ~ scale(net_density_wog)))
+with(grpyr_df, plot(simulationOutput$scaledResiduals ~ scale(n_adults)))
+with(grpyr_df, plot(simulationOutput$scaledResiduals ~ scale(net_density_wog_resid)))
 with(grpyr_df, plot(simulationOutput$scaledResiduals ~ scale(obs_effort)))
 with(grpyr_df, plot(simulationOutput$scaledResiduals ~ hydroyear))
 ## odds ratios and 95% CI on odds ratio - if 95% CI on OR includes 1 the predictor is not sig
@@ -989,7 +1177,7 @@ testDispersion(simulationOutput) # Overdispersion check
 testUniformity(simulationOutput = simulationOutput) # Heteroscedasticity check
 testZeroInflation(simulationOutput) # Zero inflation check
 with(grpyr_df, plot(simulationOutput$scaledResiduals ~ n_adults))
-with(grpyr_df, plot(simulationOutput$scaledResiduals ~ net_density_wog))
+with(grpyr_df, plot(simulationOutput$scaledResiduals ~ net_density_wog_resid))
 ## odds ratios and 95% CI on odds ratio - if 95% CI on OR includes 1 the predictor is not sig
 #exp(cbind(OR = coef(logis.model.moving), confint(logis.model.moving)))
 
@@ -1006,7 +1194,7 @@ testDispersion(simulationOutput) # Overdispersion check
 testUniformity(simulationOutput = simulationOutput) # Heteroscedasticity check
 testZeroInflation(simulationOutput) # Zero inflation check
 with(grpyr_df, plot(simulationOutput$scaledResiduals ~ n_adults))
-with(grpyr_df, plot(simulationOutput$scaledResiduals ~ net_density_wog))
+with(grpyr_df, plot(simulationOutput$scaledResiduals ~ net_density_wog_resid))
 ## odds ratios and 95% CI on odds ratio - if 95% CI on OR includes 1 the predictor is not sig
 #exp(cbind(OR = coef(logis.model.feeding_per_moving), confint(logis.model.feeding_per_moving)))
 
@@ -1071,7 +1259,7 @@ grpyr_df_post2000 <- grpyr_df_post2000 %>%
          NVR=ifelse(is.na(NVR), 0, NVR),
          WAX=ifelse(is.na(WAX), 0, WAX),
          EDJ=ifelse(is.na(EDJ), 0, EDJ)) %>%
-  mutate(HighEnFoods=B+F+T)
+  mutate(HighEnFoods=D+G+F)
 
 
 # ---- TIME SPENT FEEDING ON CORMS ---------------
@@ -1079,8 +1267,8 @@ grpyr_df_post2000 <- grpyr_df_post2000 %>%
 logis.model.corms<-glmer(cbind(C, n_feeding-C) ~ scale(n_adults) +
                                                  #I(scale(n_adults)^2) +
                                                  #poly(n_adults, 2) +
-                                                 #scale(net_density_wog) +
-                                                 poly(net_density_wog, 2) +
+                                                 scale(net_density_wog) +
+                                                 #poly(net_density_wog, 2) +
                                                  #I(scale(net_density_wog)^2) +
                                                  #scale(n_adults)*scale(net_density_wog) +
                                                  scale(obs_effort) +
@@ -1310,7 +1498,7 @@ foraging.gee.m <- geeglm(cbind(n_feeding+n_moving, n_total_sample-n_feeding-n_mo
                                                                                         scale(net_density_wog) +
                                                                                         #I(scale(net_density_wog)^2) +
                                                                                         #scale(n_adults)*scale(net_density_wog) +
-                                                                                        post1999 +
+                                                                                        #post1999 +
                                                                                         scale(obs_effort) +
                                                                                         scale(rain_avg),
                                                                                         #gid + 
@@ -1353,7 +1541,7 @@ moving.gee.m <- geeglm(cbind(n_moving, n_total_sample-n_moving) ~ scale(n_adults
                                                                    scale(net_density_wog) +
                                                                    #I(scale(net_density_wog)^2) +
                                                                    #scale(n_adults)*scale(net_density_wog) +
-                                                                   post1999 +
+                                                                   #post1999 +
                                                                    scale(obs_effort) +
                                                                    scale(rain_avg),
                                                                    #gid + 
@@ -1396,7 +1584,7 @@ feedmov.gee.m <- geeglm(cbind(n_feeding, n_moving) ~ scale(n_adults) +
                                                      scale(net_density_wog) +
                                                      #I(scale(net_density_wog)^2) +
                                                      #scale(n_adults)*scale(net_density_wog) +
-                                                     post1999 +
+                                                     #post1999 +
                                                      scale(obs_effort) +
                                                      scale(rain_avg),
                                                      #gid + 
@@ -1434,32 +1622,9 @@ rownames(citab) <- rownames(cc)
 
 ```
 
-##### Visualizations:
-
-```{r}
-# Fill predicted values using regression model
-grpyr_df$outcome_m1 <- predict(foraging.gee.m, grpyr_df, type="response")
-# Plot Predicted data and original data points
-ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m1)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Predicted Outcome for Feeding Model")+geom_smooth()
-ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m1)) + geom_point()+labs(x = "Network Density", y="Outcome", title="Network Density vs. Predicted Outcome for Feeding Model")+geom_smooth()
-
-grpyr_df$outcome_m2 <- predict(moving.gee.m, grpyr_df, type="response")
-# Plot Predicted data and original data points
-ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m2)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Predicted Outcome for Moving Model")+geom_smooth()
-ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m2)) + geom_point()+labs(x = "Network Density", y="Outcome",  title="Network Density vs. Predicted Outcome for Moving Model")+geom_smooth()
-
-grpyr_df$outcome_m3 <- predict(feedmov.gee.m, grpyr_df, type="response")
-# Plot Predicted data and original data points
-ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m3)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Predicted Outcome for Feeding Per Moving Model")+geom_smooth()
-ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m3)) + geom_point()+labs(x = "Network Density", y="Outcome", title="Network Density vs. Predicted Outcome for Feeding Per Moving Model")+geom_smooth()
-```
-
-
 #### 4.1.4 FOOD TYPES VS SOCIALITY (post-2000) (GEE)
 
 ```{r}
-#NOTE: I ADDED CORMS AS AN EXAMPLE BUT CONTINUE FOR ALL THE MODELS IN 4.1.2 AS GEES
-
 # ---- MODELS GEE ---------------------------------------------------------
 
 #Eliminate years before food type data was available
@@ -1481,7 +1646,7 @@ grpyr_df_post2000 <- grpyr_df_post2000 %>%
          NVR=ifelse(is.na(NVR), 0, NVR),
          WAX=ifelse(is.na(WAX), 0, WAX),
          EDJ=ifelse(is.na(EDJ), 0, EDJ)) %>%
-  mutate(HighEnFoods=B+F+T)
+  mutate(HighEnFoods=D+G+F)
 
 grpyr_df_post2000 <- grpyr_df %>%
   subset(start > as.Date("2000-01-01")) %>%
@@ -1520,73 +1685,485 @@ citab <- with(as.data.frame(cc),
      cbind(lwr=Estimate-1.96*Std.err,
            upr=Estimate+1.96*Std.err))
 rownames(citab) <- rownames(cc)
-
-# ---- TIME SPENT FEEDING ON SEEDS ---------------
-
-seeds.gee.m <- geeglm(cbind(D, n_feeding-D) ~ scale(n_adults) +
-                                              #I(scale(n_adults)^2) +
-                                              scale(net_density_wog) +
-                                              #I(scale(net_density_wog)^2) +
-                                              #scale(n_adults)*scale(net_density_wog) +
-                                              scale(obs_effort) +
-                                              scale(rain_avg),
-                                              #gid + 
-                                              #hydroyear,
-                                              #weights = n_total_sample,
-                                              data = grpyr_df_post2000,
-                                              corstr="ar1",
-                                              waves=wav,
-                                              family=binomial(logit), 
-                                              id=gid) 
-
-# ---- TIME SPENT FEEDING ON VERTEBRATES ---------------
-
-
-vertebrates.gee.m <- geeglm(cbind(NVR, n_feeding-NVR) ~ scale(n_adults) +
-                                              #I(scale(n_adults)^2) +
-                                              scale(net_density_wog) +
-                                              #I(scale(net_density_wog)^2) +
-                                              #scale(n_adults)*scale(net_density_wog) +
-                                              scale(obs_effort) +
-                                              scale(rain_avg),
-                                              #gid + 
-                                              #hydroyear,
-                                              #weights = n_total_sample,
-                                              data = grpyr_df_post2000,
-                                              corstr="ar1",
-                                              waves=wav,
-                                              family=binomial(logit), 
-                                              id=gid) 
-
-
-# ---- TIME SPENT FEEDING ON FRUITS ---------------
-
-
-fruits.gee.m <- geeglm(cbind(F, n_feeding-F) ~ scale(n_adults) +
-                                              #I(scale(n_adults)^2) +
-                                              scale(net_density_wog) +
-                                              #I(scale(net_density_wog)^2) +
-                                              #scale(n_adults)*scale(net_density_wog) +
-                                              scale(obs_effort) +
-                                              scale(rain_avg),
-                                              #gid + 
-                                              #hydroyear,
-                                              #weights = n_total_sample,
-                                              data = grpyr_df_post2000,
-                                              corstr="ar1",
-                                              waves=wav,
-                                              family=binomial(logit), 
-                                              id=gid) 
 ```
 
-##### Visualizations:
+#### 4.1.5 FINAL: FORAGING EFFICIENCY VS SOCIALITY (GEE)
 
 ```{r}
-# Fill predicted values using regression model
-grpyr_df$outcome_m1 <- predict(fruits.gee.m, grpyr_df, type="response")
+# ---- MODELS GEE -------------------------------------------------------------
+
+#https://www.youtube.com/watch?v=qoqhPq_VILc
+#https://www.youtube.com/watch?v=4qTZt1M17xY
+
+library(geepack)
+
+grpyr_df <- grpyr_df[order(grpyr_df$gid, grpyr_df$hydroyear),]
+wav <- grpyr_df$hydroyear
+
+#Calculate network density residuals with hours observed
+#l1<- lm(scale(log(net_density_wog))~scale(log(hours_observed_yr)),data=grpyr_df)
+#grpyr_df$net_density_wog_resid2<- resid(l1)
+
+
+# ---- TIME SPENT FEEDING --------------------------
+
+#With number of adults
+feeding.gee.m1 <- geeglm(cbind(n_feeding, n_total_sample-n_feeding) ~ scale(n_adults) +
+                                                                      #I(scale(n_adults)^2) +
+                                                                      scale(net_density_wog) +
+                                                                      #I(scale(net_density_wog)^2) +
+                                                                      #scale(n_adults)*scale(net_density_wog) +
+                                                                      #post1999 +
+                                                                      scale(obs_effort) +
+                                                                      scale(rain_avg),
+                                                                      #gid + 
+                                                                      #hydroyear,
+                                                                      #weights = n_total_sample,
+                                                                      data = grpyr_df,
+                                                                      corstr="ar1",
+                                                                      waves=wav,
+                                                                      family=binomial(logit), 
+                                                                      id=gid) 
+
+
+QIC(feeding.gee.m1)
+
+summary(feeding.gee.m1)
+
+cc <- coef(summary(feeding.gee.m1))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+#With number of adults and juveniles
+feeding.gee.m2 <- geeglm(cbind(n_feeding, n_total_sample-n_feeding) ~ scale(n_members) +
+                                                                      #I(scale(n_members)^2) +
+                                                                      scale(net_density_wog) +
+                                                                      #I(scale(net_density_wog)^2) +
+                                                                      #scale(n_members)*scale(net_density_wog) +
+                                                                      #post1999 +
+                                                                      scale(obs_effort) +
+                                                                      scale(rain_avg),
+                                                                      #gid + 
+                                                                      #hydroyear,
+                                                                      #weights = n_total_sample,
+                                                                      data = grpyr_df,
+                                                                      corstr="ar1",
+                                                                      waves=wav,
+                                                                      family=binomial(logit), 
+                                                                      id=gid) 
+
+
+QIC(feeding.gee.m2)
+
+summary(feeding.gee.m2)
+
+cc <- coef(summary(feeding.gee.m2))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+# ---- TIME SPENT MOVING --------------------------
+
+#With number of adults
+moving.gee.m1 <- geeglm(cbind(n_moving, n_total_sample-n_moving) ~ scale(n_adults) +
+                                                                   #I(scale(n_adults)^2) +
+                                                                   scale(net_density_wog) +
+                                                                   #I(scale(net_density_wog)^2) +
+                                                                   #scale(n_adults)*scale(net_density_wog) +
+                                                                   #post1999 +
+                                                                   scale(obs_effort) +
+                                                                   scale(rain_avg),
+                                                                   #gid + 
+                                                                   #hydroyear,
+                                                                   #weights = n_total_sample,
+                                                                   data = grpyr_df,
+                                                                   corstr="ar1",
+                                                                   waves=wav,
+                                                                   family=binomial(logit), 
+                                                                   id=gid) 
+
+
+QIC(moving.gee.m1)
+
+summary(moving.gee.m1)
+
+cc <- coef(summary(moving.gee.m1))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+#With number of adults and juveniles
+moving.gee.m2 <- geeglm(cbind(n_moving, n_total_sample-n_moving) ~ scale(n_members) +
+                                                                   #I(scale(n_members)^2) +
+                                                                   scale(net_density_wog) +
+                                                                   #I(scale(net_density_wog)^2) +
+                                                                   #scale(n_members)*scale(net_density_wog) +
+                                                                   #post1999 +
+                                                                   scale(obs_effort) +
+                                                                   scale(rain_avg),
+                                                                   #gid + 
+                                                                   #hydroyear,
+                                                                   #weights = n_total_sample,
+                                                                   data = grpyr_df,
+                                                                   corstr="ar1",
+                                                                   waves=wav,
+                                                                   family=binomial(logit), 
+                                                                   id=gid) 
+
+
+QIC(moving.gee.m2)
+
+summary(moving.gee.m2)
+
+cc <- coef(summary(moving.gee.m2))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+
+# ---- TIME SPENT FEEDING RELATIVE TO FORAGING ---------------
+
+#With number of adults
+feedmov.gee.m1 <- geeglm(cbind(n_feeding, n_moving) ~ scale(n_adults) +
+                                                     #I(scale(n_adults)^2) +
+                                                     scale(net_density_wog) +
+                                                     #I(scale(net_density_wog)^2) +
+                                                     #scale(n_adults)*scale(net_density_wog) +
+                                                     #post1999 +
+                                                     scale(obs_effort) +
+                                                     scale(rain_avg),
+                                                     #gid + 
+                                                     #hydroyear,
+                                                     #weights = n_total_sample,
+                                                     data = grpyr_df,
+                                                     corstr="ar1",
+                                                     waves=wav,
+                                                     family=binomial(logit), 
+                                                     id=gid) 
+
+
+QIC(feedmov.gee.m1)
+
+summary(feedmov.gee.m1)
+
+cc <- coef(summary(feedmov.gee.m1))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+#With number of adults and juveniles
+feedmov.gee.m2 <- geeglm(cbind(n_feeding, n_moving) ~ scale(n_members) +
+                                                     #I(scale(n_members)^2) +
+                                                     scale(net_density_wog) +
+                                                     #I(scale(net_density_wog)^2) +
+                                                     #scale(n_members)*scale(net_density_wog) +
+                                                     #post1999 +
+                                                     scale(obs_effort) +
+                                                     scale(rain_avg),
+                                                     #gid + 
+                                                     #hydroyear,
+                                                     #weights = n_total_sample,
+                                                     data = grpyr_df,
+                                                     corstr="ar1",
+                                                     waves=wav,
+                                                     family=binomial(logit), 
+                                                     id=gid) 
+
+
+QIC(feedmov.gee.m2)
+
+summary(feedmov.gee.m2)
+
+cc <- coef(summary(feedmov.gee.m2))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+
+
+# ---- PLOT MODEL PREDICTED RELATIONSHIPS ---------------
+
+#Time spent feeding
+grpyr_df$outcome_m1 <- predict(feeding.gee.m1, grpyr_df, type="response")
 # Plot Predicted data and original data points
-ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m1)) + geom_point()+labs(x = "Group Size", y="Outcome", title="Group Size vs. Predicted Outcome for Fruit Model")+geom_smooth()
-ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m1)) + geom_point()+labs(x = "Network Density", y="Outcome", title="Network Density vs. Predicted Outcome for Fruit Model")+geom_smooth()
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m1, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m1, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df, aes(x=rain_avg, y=outcome_m1, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+# Fill predicted values using regression model
+grpyr_df$outcome_m1 <- predict(feeding.gee.m2, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=outcome_m1, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+#Time spent moving
+grpyr_df$outcome_m2 <- predict(moving.gee.m1, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m2, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m2, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Outcome",  title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df, aes(x=rain_avg, y=outcome_m2, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Outcome",  title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+grpyr_df$outcome_m2 <- predict(moving.gee.m2, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=outcome_m2, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+#Time spent feeding relative to foraging
+grpyr_df$outcome_m3 <- predict(feedmov.gee.m1, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m3, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Outcome", title="")+geom_smooth() + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m3, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df, aes(x=rain_avg, y=outcome_m3, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+grpyr_df$outcome_m3 <- predict(feedmov.gee.m2, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=outcome_m3, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Outcome", title="")+geom_smooth() + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+```
+
+#### 4.1.6 FINAL: FOOD TYPES VS SOCIALITY (post-2000) (GEE with # adults)
+
+```{r}
+# ---- MODELS GEE ---------------------------------------------------------
+
+#Eliminate years before food type data was available
+grpyr_df_post2000 <- grpyr_df %>%
+  subset(start > as.Date("2000-01-01"))
+
+#Replace NAs for feeding counts with zeros
+grpyr_df_post2000 <- grpyr_df_post2000 %>%
+  mutate(B=ifelse(is.na(B), 0, B),
+         C=ifelse(is.na(C), 0, C),
+         D=ifelse(is.na(D), 0, D),
+         F=ifelse(is.na(F), 0, F),
+         G=ifelse(is.na(G), 0, G),
+         K=ifelse(is.na(K), 0, K),
+         L=ifelse(is.na(L), 0, L),
+         O=ifelse(is.na(O), 0, O),
+         P=ifelse(is.na(P), 0, P),
+         T=ifelse(is.na(T), 0, T),
+         NVR=ifelse(is.na(NVR), 0, NVR),
+         WAX=ifelse(is.na(WAX), 0, WAX),
+         EDJ=ifelse(is.na(EDJ), 0, EDJ)) %>%
+  mutate(HighEnFoods=D+G+F)
+
+grpyr_df_post2000 <- grpyr_df_post2000[order(grpyr_df_post2000$gid, grpyr_df_post2000$hydroyear),]
+wav <- grpyr_df_post2000$hydroyear
+
+
+# ---- TIME SPENT FEEDING ON CORMS ---------------
+
+#With number of adults
+corms.gee.m1 <- geeglm(cbind(C, n_feeding-C) ~ scale(n_adults) +
+                                              #I(scale(n_adults)^2) +
+                                              scale(net_density_wog) +
+                                              #I(scale(net_density_wog)^2) +
+                                              #scale(n_adults)*scale(net_density_wog) +
+                                              scale(obs_effort) +
+                                              scale(rain_avg),
+                                              #gid + 
+                                              #hydroyear,
+                                              #weights = n_total_sample,
+                                              data = grpyr_df_post2000,
+                                              corstr="ar1",
+                                              waves=wav,
+                                              family=binomial(logit), 
+                                              id=gid) 
+
+
+QIC(corms.gee.m1)
+
+summary(corms.gee.m1)
+
+cc <- coef(summary(corms.gee.m1))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+#With number of adults and juveniles
+corms.gee.m2 <- geeglm(cbind(C, n_feeding-C) ~ scale(n_members) +
+                                              #I(scale(n_members)^2) +
+                                              scale(net_density_wog) +
+                                              #I(scale(net_density_wog)^2) +
+                                              #scale(n_members)*scale(net_density_wog) +
+                                              scale(obs_effort) +
+                                              scale(rain_avg),
+                                              #gid + 
+                                              #hydroyear,
+                                              #weights = n_total_sample,
+                                              data = grpyr_df_post2000,
+                                              corstr="ar1",
+                                              waves=wav,
+                                              family=binomial(logit), 
+                                              id=gid) 
+
+
+QIC(corms.gee.m2)
+
+summary(corms.gee.m2)
+
+cc <- coef(summary(corms.gee.m2))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+# ---- TIME SPENT FEEDING ON HIGH ENERGY FOODS -----
+
+#With number of adults
+highen.gee.m1 <- geeglm(cbind(HighEnFoods, n_feeding-HighEnFoods) ~ scale(n_adults) +
+                                                                   #I(scale(n_adults)^2) +
+                                                                   scale(net_density_wog) +
+                                                                   #I(scale(net_density_wog)^2) +
+                                                                   #scale(n_adults)*scale(net_density_wog) +
+                                                                   scale(obs_effort) +
+                                                                   scale(rain_avg),
+                                                                   #gid + 
+                                                                   #hydroyear,
+                                                                   #weights = n_total_sample,
+                                                                   data = grpyr_df_post2000,
+                                                                   corstr="ar1",
+                                                                   waves=wav,
+                                                                   family=binomial(logit), 
+                                                                   id=gid) 
+
+
+QIC(highen.gee.m1)
+
+summary(highen.gee.m1)
+
+cc <- coef(summary(highen.gee.m1))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+#With number of adults and juveniles
+highen.gee.m2 <- geeglm(cbind(HighEnFoods, n_feeding-HighEnFoods) ~ scale(n_members) +
+                                                                   #I(scale(n_members)^2) +
+                                                                   scale(net_density_wog) +
+                                                                   #I(scale(net_density_wog)^2) +
+                                                                   #scale(n_members)*scale(net_density_wog) +
+                                                                   scale(obs_effort) +
+                                                                   scale(rain_avg),
+                                                                   #gid + 
+                                                                   #hydroyear,
+                                                                   #weights = n_total_sample,
+                                                                   data = grpyr_df_post2000,
+                                                                   corstr="ar1",
+                                                                   waves=wav,
+                                                                   family=binomial(logit), 
+                                                                   id=gid) 
+
+
+QIC(highen.gee.m2)
+
+summary(highen.gee.m2)
+
+cc <- coef(summary(highen.gee.m2))
+citab <- with(as.data.frame(cc),
+     cbind(lwr=Estimate-1.96*Std.err,
+           upr=Estimate+1.96*Std.err))
+rownames(citab) <- rownames(cc)
+
+
+
+# ---- PLOT MODEL PREDICTED RELATIONSHIPS ---------------
+
+#Time spent feeding on corms
+grpyr_df$outcome_m1 <- predict(corms.gee.m1, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m1, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m1, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df, aes(x=rain_avg, y=outcome_m1, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+# Fill predicted values using regression model
+grpyr_df$outcome_m1 <- predict(corms.gee.m2, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=outcome_m1, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+#Time spent feeding on high energy foods
+grpyr_df$outcome_m2 <- predict(highen.gee.m1, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p1 <- ggplot(data=grpyr_df, aes(x=n_adults, y=outcome_m2, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Adults", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p3 <- ggplot(data=grpyr_df, aes(x=net_density_wog, y=outcome_m2, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Network Density", y="Outcome",  title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+p4 <- ggplot(data=grpyr_df, aes(x=rain_avg, y=outcome_m2, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Average Daily Rainfall", y="Outcome",  title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+grpyr_df$outcome_m2 <- predict(highen.gee.m2, grpyr_df, type="response")
+# Plot Predicted data and original data points
+p2 <- ggplot(data=grpyr_df, aes(x=n_members, y=outcome_m2, color=as.character(gid))) + geom_point(aes(size = n_total_sample), alpha = 0.5) + labs(x = "Number of Members", y="Outcome", title="") + geom_smooth() + theme_cowplot() + guides(color="none")
+
+pgrid <- plot_grid(
+  p1 + theme(legend.position="none"),
+  p2 + theme(legend.position="none"),
+  p3 + theme(legend.position="none"),
+  p4 + theme(legend.position="none"),
+      labels = c("", "", "", ""),
+      ncol = 2, nrow = 2)
+
+plot_grid(pgrid, rel_widths = c(3, .4))
+
+
+
 ```
 
 #### TEST SECTION
@@ -2432,24 +3009,123 @@ citab <- with(as.data.frame(cc),
 rownames(citab) <- rownames(cc)
 
 
+# ---- TESTING DIFFERENT CORMS MODELS -------------------------------
+
+# VISUALIZATION
+ggplot(data=grpyr_df_post2000, aes(x=rain_avg, y=C/n_total_sample)) + geom_point()+labs(x = "Average Rainfall", y="Proportion of Total Time Spent Eating Corms", title = "Relationship of average rainfall vs. proportion of total time spent feeding on corms")+geom_smooth(method=lm, se=FALSE, col='blue')
+
+ggplot(data=grpyr_df_post2000, aes(x=rain_avg, y=C/n_feeding)) + geom_point()+labs(x = "Average Rainfall", y="Proportion of Feeding Time Spent Eating Corms", title = "Relationship of average rainfall vs. proportion of feeding time spent feeding on corms")+geom_smooth(method=lm, se=FALSE, col='blue')
+
+
+
+logis.model.corms<-glm(cbind(C, n_feeding-C) ~ scale(n_adults) + scale(rain_avg),
+                                                 data=grpyr_df_post2000,
+                                                 family = "binomial" (link="logit"))
+summary(logis.model.corms)
+
+
+logis.model.corms<-glm(C/n_feeding ~ scale(n_adults) + scale(rain_avg),
+                                                 data=grpyr_df_post2000,
+                                                 family = "binomial" (link="logit"))
+summary(logis.model.corms)
+
+
+logis.model.corms<-lm(C/n_feeding ~ scale(n_adults) + scale(rain_avg),
+                                                 data=grpyr_df_post2000)
+summary(logis.model.corms)
+
+
+
+# ---- COMPARING GLMM AND GEE ---------------------------------------
+#Eliminate years before food type data was available
+grpyr_df_post2000 <- grpyr_df %>%
+  subset(start > as.Date("2000-01-01"))
+
+logis.model.feeding_per_moving<-glmer(cbind(n_feeding, n_moving) ~ scale(n_adults) +
+                                                                   scale(net_density_wog_resid) +
+                                                                   #scale(obs_effort) +
+                                                                   scale(rain_avg) +
+                                                                   #post1999 +
+                                                                   (1|gid),
+                                                                   (1|hydroyear),
+                                                                   data=grpyr_df_post2000,
+                                                                   glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000)),
+                                                                   family = "binomial" (link="logit"))
+
+summary(logis.model.feeding_per_moving)
+
+library(ggeffects)
+plot(ggemmeans(logis.model.feeding_per_moving, terms = c("hydroyear", "n_adults"), 
+               condition = c(net_density_wog_resid = mean(grpyr_df_post2000$net_density_wog_resid),
+                             rain_avg = mean(grpyr_df_post2000$rain_avg))))
+  ggplot2::ggtitle("GLMER Effect plot")
+
+  
+
+library(geepack)
+#Eliminate years before food type data was available
+grpyr_df_post2000 <- grpyr_df %>%
+  subset(start > as.Date("2000-01-01"))
+
+grpyr_df_post2000 <- grpyr_df_post2000[order(grpyr_df_post2000$gid, grpyr_df_post2000$hydroyear),]
+wav <- grpyr_df_post2000$hydroyear
+
+feedmov.gee.m <- geeglm(cbind(n_feeding, n_moving) ~ scale(n_adults) +
+                                                     #I(scale(n_adults)^2) +
+                                                     scale(net_density_wog_resid) +
+                                                     #I(scale(net_density_wog)^2) +
+                                                     #scale(n_adults)*scale(net_density_wog) +
+                                                     #post1999 +
+                                                     #scale(obs_effort) +
+                                                     scale(rain_avg),
+                                                     #gid + 
+                                                     #hydroyear,
+                                                     #weights = n_total_sample,
+                                                     data = grpyr_df_post2000,
+                                                     corstr="independence",
+                                                     #waves=wav,
+                                                     family=binomial(logit), 
+                                                     id=gid) 
+
+summary(feedmov.gee.m)
+QIC(feedmov.gee.m)
+
+feedmov.gee.m <- geeglm(cbind(n_feeding, n_moving) ~ scale(n_adults) +
+                                                     #I(scale(n_adults)^2) +
+                                                     scale(net_density_wog_resid) +
+                                                     #I(scale(net_density_wog)^2) +
+                                                     #scale(n_adults)*scale(net_density_wog) +
+                                                     #post1999 +
+                                                     #scale(obs_effort) +
+                                                     scale(rain_avg),
+                                                     #gid + 
+                                                     #hydroyear,
+                                                     #weights = n_total_sample,
+                                                     data = grpyr_df_post2000,
+                                                     corstr="ar1",
+                                                     waves=wav,
+                                                     family=binomial(logit), 
+                                                     id=gid) 
+
+summary(feedmov.gee.m)
+QIC(feedmov.gee.m)
+
+
+
+
+
+gee.model.feeding_per_moving <- gee(cbind(n_feeding, n_moving) ~ scale(n_adults) +
+                                                                 scale(net_density_wog_resid) +
+                                                                 #scale(obs_effort) +
+                                                                 scale(rain_avg) +
+                                                                 post1999,
+                                                                 data = grpyr_df, 
+                                                                 id = gid, 
+                                                                 family = binomial,
+                                                                 corstr = "independence")
+
+print.summary.gee(gee.model.feeding_per_moving)
+
+
 ```
 
-#### Distribution by group ID
-
-```{r}
-ggplot(grpyr_df, aes(x=n_adults, fill=as.factor(gid))) + 
-  geom_histogram() + 
-  labs(title="Distribution of Group Size Grouped by Group", x="Group Size", y="Frequency",fill = "Group ID")
-
-ggplot(grpyr_df, aes(x=net_density_wog_resid, fill=as.factor(gid))) + 
-  geom_histogram() + 
-  labs(title="Distribution of Network Density Grouped by Group", x="Network Density", y="Frequency",fill = "Group ID")
-
-ggplot(grpyr_df, aes(x=pct_feeding, fill=as.factor(gid))) + 
-  geom_histogram() + 
-  labs(title="Distribution of Proportion Time Feeding Grouped by Group", x="Proportion Time Feeding", y="Frequency",fill = "Group ID")
-
-ggplot(grpyr_df, aes(x=pct_moving, fill=as.factor(gid))) + 
-  geom_histogram() + 
-  labs(title="Distribution of Proportion Time Moving Grouped by Group", x="Proportion Time Moving", y="Frequency",fill = "Group ID")
-```
