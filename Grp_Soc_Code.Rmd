@@ -554,7 +554,6 @@ grpyr_df<-grpyr_df%>%
   mutate(n_feeding=n_feeding_old+n_feeding_new)%>%
   mutate(n_moving=n_moving_old+n_moving_new)%>%
   select(-n_total_sample_old,-n_feeding_old,-n_moving_old,-n_total_sample_new, -n_feeding_new, -n_moving_new)
-
 ```
 
 #### 3.4 WEATHER VARIABLES
@@ -3129,3 +3128,69 @@ print.summary.gee(gee.model.feeding_per_moving)
 
 ```
 
+
+## Plots
+
+```{r}
+corm_proportions<-grpyr_df%>%select(gid, start, rain_avg,`NA`,B,C,D,`F`,G,K,L,O,P,`T`,X,R,NVR,WAX,EDJ,GAR,VRT)
+corm_proportions[is.na(corm_proportions)] <- 0
+corm_proportions<-corm_proportions%>%
+  mutate(prop_corms_with_NA=C/(`NA`+B+C+D+`F`+G+K+L+O+P+`T`+X+R+NVR+WAX+EDJ+GAR+VRT))%>%
+  mutate(prop_corms_without_NA=C/(B+C+D+`F`+G+K+L+O+P+`T`+X+R+NVR+WAX+EDJ+GAR+VRT))
+
+ggplot(data=corm_proportions, aes(x=prop_corms_with_NA, y=rain_avg, color=as.character(gid))) + geom_point() + labs(x = "Proportion of diet corms", y="Average Daily Rainfall", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + guides(color="none")+ggtitle("With unknown foodtypes")
+ggplot(data=corm_proportions, aes(x=prop_corms_without_NA, y=rain_avg, color=as.character(gid))) + geom_point() + labs(x = "Proportion of diet corms", y="Average Daily Rainfall", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + guides(color="none")+ggtitle("Without unknown foodtypes")
+
+# filter to data after 1990
+corm_proportions_plot_2<-corm_proportions%>%filter(start>=as.Date("1990-11-01"))%>%
+  group_by(start)%>%
+  summarise(avg_corms_with_NA = mean(prop_corms_with_NA),avg_corms_without_NA=mean(prop_corms_without_NA), rainfall=mean(rain_avg))
+
+# plot the lines
+ggplot() +
+  geom_line(data = corm_proportions_plot_2, aes(x = start, y = rainfall, color="average daily rainfall")) +
+  geom_line(data = corm_proportions_plot_2, aes(x = start, y = avg_corms_with_NA, color="avg prop time spent on corms")) +
+  scale_color_manual(name = "Groups", values = c("average daily rainfall" = "blue", "avg prop time spent on corms" = "red")) +
+  labs(x = "Year", y = "Value", title = "Rainfall & Corms by Year with Unknown")
+
+# plot the lines
+ggplot() +
+  geom_line(data = corm_proportions_plot_2, aes(x = start, y = rainfall, color="average daily rainfall")) +
+  geom_line(data = corm_proportions_plot_2, aes(x = start, y = avg_corms_without_NA, color="avg prop time spent on corms")) +
+  scale_color_manual(name = "Groups", values = c("average daily rainfall" = "blue", "avg prop time spent on corms" = "red")) +
+  labs(x = "Year", y = "Value", title = "Rainfall & Corms by Year without Unknown")
+
+
+```
+
+
+```{r}
+## adding grooming data
+count_grooming_new<-function(sub_members_df){
+    total_point_samples_gr_new(sub_members_df)%>%
+    filter(activity=="G"|activity=="EG")%>%
+    group_by(sname)%>%
+    count()
+}
+count_grooming_old<-function(sub_members_df){
+    total_point_samples_gr_old(sub_members_df)%>%
+    filter(act=="G"|act=="EG")%>%
+    group_by(sname)%>%
+    count()
+}
+grpyr_df<-grpyr_df%>%
+  rowwise() %>% 
+  mutate(n_grooming_new=sum(count_grooming_new(sub_members_df)$n))%>%
+  mutate(n_grooming_old=sum(count_grooming_old(sub_members_df)$n))
+
+grpyr_df<-grpyr_df%>%
+  mutate(n_grooming=n_grooming_new+n_grooming_old)%>%
+  select(-n_grooming_old,-n_grooming_new)
+
+## calculate grooming proportions
+grpyr_df<-grpyr_df%>%
+  mutate(pct_grooming=n_grooming/n_total_sample)
+
+## grooming vs moving plot
+ggplot(data=grpyr_df, aes(x=pct_grooming, y=pct_moving, color=as.character(gid))) + geom_point() + labs(x = "Proportion of points moving", y="Proportion of points grooming or being groomed", title = "") + geom_smooth(method=lm, se=FALSE, col='black') + guides(color="none")+ggtitle("Proportion of points moving vs. grooming/being groomed for females")
+```
